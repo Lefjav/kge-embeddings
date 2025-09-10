@@ -5,8 +5,27 @@ from typing import Dict, Tuple
 Mapping = Dict[str, int]
 
 
+def create_mappings_from_all(train_path: str, valid_path: str, test_path: str) -> Tuple[Mapping, Mapping]:
+    """Creates mappings from all splits (transductive learning)."""
+    entity_counter = Counter()
+    relation_counter = Counter()
+    
+    for path in (train_path, valid_path, test_path):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                h, r, t = line.rstrip("\n").split("\t")
+                entity_counter.update([h, t])
+                relation_counter.update([r])
+    
+    entity2id = {e: i for i, (e, _) in enumerate(entity_counter.most_common())}
+    relation2id = {r: i for i, (r, _) in enumerate(relation_counter.most_common())}
+    
+    print(f"Created mappings: {len(entity2id)} entities, {len(relation2id)} relations")
+    return entity2id, relation2id
+
+
 def create_mappings(dataset_path: str) -> Tuple[Mapping, Mapping]:
-    """Creates separate mappings to indices for entities and relations."""
+    """Creates separate mappings to indices for entities and relations (legacy function)."""
     # counters to have entities/relations sorted from most frequent
     entity_counter = Counter()
     relation_counter = Counter()
@@ -49,7 +68,5 @@ class FB15KDataset(data.Dataset):
 
     @staticmethod
     def _to_idx(key: str, mapping: Mapping) -> int:
-        try:
-            return mapping[key]
-        except KeyError:
-            return len(mapping)
+        assert key in mapping, f"OOV key in split: {key}"
+        return mapping[key]
