@@ -1,4 +1,6 @@
 import torch
+from collections import defaultdict
+import numpy as np
 
 
 def hits_at_k(pred: torch.Tensor, gold: torch.Tensor, k: int = 10, largest: bool = False) -> float:
@@ -216,3 +218,159 @@ def hit_at_k(predictions: torch.Tensor, ground_truth_idx: torch.Tensor, device: 
     gold = ground_truth_idx.squeeze() if ground_truth_idx.dim() > 1 else ground_truth_idx
     hits_score = hits_at_k(predictions, gold, k=k, largest=False)
     return int(hits_score * predictions.size(0))  # Convert back to count for legacy compatibility
+
+
+def _build_constraints(train_triples):
+    """Build type constraints from training triples."""
+    from collections import defaultdict
+    allowed_heads, allowed_tails = defaultdict(set), defaultdict(set)
+    for (h, r, t) in train_triples:
+        allowed_heads[r].add(h)
+        allowed_tails[r].add(t)
+    return allowed_heads, allowed_tails
+
+
+def evaluate_ranking(model, test_triples, all_true, e2id, r2id,
+                     filtered=True, per_relation=True, ks=(1,3,10), 
+                     train_triples=None, type_constrained=False):
+    """Comprehensive ranking evaluation with optional filtering and per-relation metrics."""
+    device = next(model.parameters()).device
+    E = len(e2id)
+
+    # Precompute true tails for efficiency
+    true_tails = defaultdict(set)
+    for (h, r, t) in all_true:
+        true_tails[(h, r)].add(t)
+
+    # Build type constraints if requested
+    allowed_heads, allowed_tails = None, None
+    if type_constrained and train_triples is not None:
+        allowed_heads, allowed_tails = _build_constraints(train_triples)
+
+    def rank_tail(h, r, t):
+        tails = torch.arange(E, device=device)
+        scores = model.score_hr_t(torch.tensor([h], device=device),
+                                  torch.tensor([r], device=device),
+                                  tails)
+        if filtered:
+            with torch.no_grad():
+                # mask true (h,r,t') except the actual t
+                for tprime in true_tails.get((h, r), set()):
+                    if tprime != t:
+                        scores[tprime] = -1e9  # assuming higher is better
+        
+        # Apply type constraints
+        if type_constrained and allowed_tails is not None:
+            allowed = allowed_tails.get(r, None)
+            if allowed is not None and len(allowed) < E:
+                mask = torch.ones(E, dtype=torch.bool, device=device)
+                mask[list(allowed)] = False
+                scores[mask] = -1e9
+        
+        rank = (scores > scores[t]).sum().item() + 1
+        return rank
+
+    def agg(ranks):
+        arr = np.array(ranks, dtype=float)
+        out = {"MRR": np.mean(1.0/arr), "MR": np.mean(arr)}
+        for k in ks: 
+            out[f"Hits@{k}"] = np.mean(arr <= k)
+        return out
+
+    ranks_all, by_rel = [], defaultdict(list)
+    for (h, r, t) in test_triples:
+        rk = rank_tail(h, r, t)
+        ranks_all.append(rk)
+        by_rel[r].append(rk)
+
+    res = {"overall": agg(ranks_all)}
+    if per_relation:
+        res["per_relation"] = {r: agg(rs) for r, rs in by_rel.items()}
+    
+    # Optional: aggregate by category
+    if train_triples is not None:
+        from data import categorize_relations
+        # Create entity type mapping for categorization
+        e2type = {}
+        for (h, r, t) in train_triples:
+            if h not in e2type:
+                e2type[h] = "CWE" if str(h).startswith("CWE-") else "CAPEC" if str(h).startswith("CAPEC-") else "CWE"
+            if t not in e2type:
+                e2type[t] = "CWE" if str(t).startswith("CWE-") else "CAPEC" if str(t).startswith("CAPEC-") else "CWE"
+        
+        rel_category = categorize_relations(train_triples, e2type, {})
+        res["per_category"] = aggregate_by_category(test_triples, by_rel, rel_category)
+    
+    return res
+
+
+def aggregate_by_category(test_triples, ranks_by_rel, rel_category):
+    """Aggregate evaluation results by relation category."""
+    from collections import defaultdict
+    agg = defaultdict(list)
+    for (h, r, t) in test_triples:
+        if r in ranks_by_rel and len(ranks_by_rel[r]):
+            agg[rel_category.get(r, "other")].extend(ranks_by_rel[r])
+    
+    # Compute MRR/Hits@k per category
+    def agg_ranks(ranks):
+        if not ranks:
+            return {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0}
+        arr = np.array(ranks, dtype=float)
+        return {
+            "MRR": np.mean(1.0/arr),
+            "Hits@1": np.mean(arr <= 1),
+            "Hits@3": np.mean(arr <= 3),
+            "Hits@10": np.mean(arr <= 10),
+            "count": len(ranks)
+        }
+    
+    return {cat: agg_ranks(ranks) for cat, ranks in agg.items()}
+
+
+def fit_calibrator(model, valid_triples, method="platt", n_neg_per_pos=1):
+    """Fit a calibrator to convert model scores to probabilities."""
+    from sklearn.isotonic import IsotonicRegression
+    from sklearn.linear_model import LogisticRegression
+
+    device = next(model.parameters()).device
+    X, y = [], []
+    E = max(max(h, t) for (h, _, t) in valid_triples) + 1
+    all_true = set(valid_triples)
+
+    for (h, r, t) in valid_triples:
+        # Positive example
+        X.append(model.score_triple(torch.tensor([h], device=device),
+                                    torch.tensor([r], device=device),
+                                    torch.tensor([t], device=device)).item())
+        y.append(1)
+        
+        # Negative examples
+        for _ in range(n_neg_per_pos):
+            # uniform negative tail not in all_true
+            while True:
+                tneg = np.random.randint(0, E)
+                if (h, r, tneg) not in all_true:
+                    break
+            X.append(model.score_triple(torch.tensor([h], device=device),
+                                        torch.tensor([r], device=device),
+                                        torch.tensor([tneg], device=device)).item())
+            y.append(0)
+
+    X = np.array(X).reshape(-1, 1)
+    y = np.array(y)
+    
+    if method == "platt":
+        lr = LogisticRegression(max_iter=1000).fit(X, y)
+        class _Platt: 
+            def transform(self, s): 
+                return lr.predict_proba(np.array(s).reshape(-1, 1))[:, 1]
+        return _Platt()
+    elif method == "isotonic":
+        ir = IsotonicRegression(out_of_bounds="clip").fit(X.ravel(), y)
+        class _Iso:
+            def transform(self, s):
+                return ir.predict(np.array(s))
+        return _Iso()
+    else:
+        return None

@@ -1,6 +1,7 @@
 from collections import Counter
 from torch.utils import data
 from typing import Dict, Tuple
+import os
 
 Mapping = Dict[str, int]
 
@@ -44,8 +45,8 @@ def create_mappings(dataset_path: str) -> Tuple[Mapping, Mapping]:
     return entity2id, relation2id
 
 
-class FB15KDataset(data.Dataset):
-    """Dataset implementation for handling FB15K and FB15K-237."""
+class MitreDataset(data.Dataset):
+    """Dataset implementation for handling MITRE attack pattern data."""
 
     def __init__(self, data_path: str, entity2id: Mapping, relation2id: Mapping):
         self.entity2id = entity2id
@@ -70,3 +71,63 @@ class FB15KDataset(data.Dataset):
     def _to_idx(key: str, mapping: Mapping) -> int:
         assert key in mapping, f"OOV key in split: {key}"
         return mapping[key]
+
+
+def _read_triples_txt(path):
+    triples = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.split("\t") if "\t" in s else s.split()
+            if len(parts) != 3:
+                continue
+            h, r, t = parts
+            triples.append((h, r, t))
+    return triples
+
+def _index_triples(triples):
+    e2id, r2id = {}, {}
+    def _get(d, k):
+        if k not in d: d[k] = len(d)
+        return d[k]
+    id_triples = []
+    for h, r, t in triples:
+        id_triples.append((_get(e2id,h), _get(r2id,r), _get(e2id,t)))
+    return e2id, r2id, id_triples
+
+def load_mitre_txt(root):
+    train = _read_triples_txt(os.path.join(root, "train.txt"))
+    valid = _read_triples_txt(os.path.join(root, "valid.txt"))
+    test  = _read_triples_txt(os.path.join(root, "test.txt"))
+    all_str = train + valid + test
+    e2id, r2id, _ = _index_triples(all_str)
+    def _map(tr): return [(e2id[h], r2id[r], e2id[t]) for (h,r,t) in tr]
+    train_id, valid_id, test_id = _map(train), _map(valid), _map(test)
+    all_true = set(_map(all_str))
+    return e2id, r2id, (train_id, valid_id, test_id), all_true
+
+
+def categorize_relations(train_triples, e2type, r2id, type_CWE="CWE", type_CAPEC="CAPEC"):
+    """
+    Returns: rel_category[id] in {"direct","path","hier"}
+    direct = only crosses CWE<->CAPEC (no intra-type)
+    hier   = only intra-type and appears as parent/child (name heuristics optional)
+    path   = everything else
+    """
+    from collections import defaultdict
+    pairs = defaultdict(set)   # r -> set of (type(h), type(t))
+    for (h,r,t) in train_triples:
+        pairs[r].add((e2type[h], e2type[t]))
+
+    rel_category = {}
+    for r, ts in pairs.items():
+        if ts.issubset({(type_CWE,type_CWE), (type_CAPEC,type_CAPEC)}):
+            rel_category[r] = "hier"
+        elif ts.issubset({(type_CWE,type_CAPEC), (type_CAPEC,type_CWE)}) and \
+             not ts.intersection({(type_CWE,type_CWE),(type_CAPEC,type_CAPEC)}):
+            rel_category[r] = "direct"
+        else:
+            rel_category[r] = "path"
+    return rel_category

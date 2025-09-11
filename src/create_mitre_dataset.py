@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Unified MITRE dataset creation with support for direct/transitive relationship analysis.
+Canonical dataset builder for MITRE TXT splits (train/valid/test).
+Any older dataset scripts are deprecated and kept only for reference.
 """
 
 import xml.etree.ElementTree as ET

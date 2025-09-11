@@ -103,6 +103,27 @@ class TransE(nn.Module):
         return (self.entities_emb(heads) + self.relations_emb(relations) - self.entities_emb(tails)).norm(p=self.norm,
                                                                                                           dim=1)
 
+    def score_triple(self, h, r, t):
+        """
+        h, r, t: 1D tensors of same length (IDs)
+        return: 1D tensor of scores (higher = better)
+        """
+        # For TransE: higher score = better (neg distance)
+        emb_h = self.entities_emb(h)
+        emb_r = self.relations_emb(r)
+        emb_t = self.entities_emb(t)
+        return -torch.norm(emb_h + emb_r - emb_t, p=self.norm, dim=1)
+
+    def score_hr_t(self, h, r, all_tails):
+        """
+        h, r: 1D tensors (typically length 1), all_tails: 1D tensor of tail IDs
+        return: 1D tensor of |all_tails| scores
+        """
+        # Expand h,r to match all_tails and call score_triple
+        H = h.expand_as(all_tails)
+        R = r.expand_as(all_tails)
+        return self.score_triple(H, R, all_tails)
+
 
 
 # Updated ComplEx class for model.py
@@ -191,6 +212,40 @@ class ComplEx(nn.Module):
             loss_per_pair = self.criterion(positive_scores, negative_scores, target)
             return loss_per_pair.mean(dim=1)
 
+    def score_triple(self, h, r, t):
+        """
+        h, r, t: 1D tensors of same length (IDs)
+        return: 1D tensor of scores (higher = better)
+        """
+        # For ComplEx: higher score = better (return positive score)
+        heads = h
+        relations = r
+        tails = t
+        
+        # Get embeddings
+        h_re = self.entities_emb_re(heads)
+        h_im = self.entities_emb_im(heads)
+        r_re = self.relations_emb_re(relations)
+        r_im = self.relations_emb_im(relations)
+        t_re = self.entities_emb_re(tails)
+        t_im = self.entities_emb_im(tails)
+        
+        # Real part only (ComplEx uses only real part)
+        real_part = (h_re * r_re * t_re + h_im * r_re * t_im + 
+                    h_re * r_im * t_im - h_im * r_im * t_re).sum(dim=1)
+        
+        return real_part
+
+    def score_hr_t(self, h, r, all_tails):
+        """
+        h, r: 1D tensors (typically length 1), all_tails: 1D tensor of tail IDs
+        return: 1D tensor of |all_tails| scores
+        """
+        # Expand h,r to match all_tails and call score_triple
+        H = h.expand_as(all_tails)
+        R = r.expand_as(all_tails)
+        return self.score_triple(H, R, all_tails)
+
 
 class RotatE(nn.Module):
     """RotatE model implementation for knowledge graph embedding."""
@@ -277,3 +332,43 @@ class RotatE(nn.Module):
             target = torch.full((batch_size, num_negs), -1, dtype=torch.long, device=self.device)
             loss_per_pair = self.criterion(positive_distances, negative_distances, target)
             return loss_per_pair.mean(dim=1)
+
+    def score_triple(self, h, r, t):
+        """
+        h, r, t: 1D tensors of same length (IDs)
+        return: 1D tensor of scores (higher = better)
+        """
+        # For RotatE: higher score = better (neg distance)
+        heads = h
+        relations = r
+        tails = t
+        
+        # Get embeddings
+        h_re = self.entities_emb_re(heads)
+        h_im = self.entities_emb_im(heads)
+        r_angles = self.relations_emb(relations)
+        t_re = self.entities_emb_re(tails)
+        t_im = self.entities_emb_im(tails)
+        
+        # Convert rotation angles to complex numbers
+        r_re = torch.cos(r_angles)
+        r_im = torch.sin(r_angles)
+        
+        # RotatE: h * r - t (complex multiplication)
+        # (h_re + i*h_im) * (r_re + i*r_im) - (t_re + i*t_im)
+        result_re = h_re * r_re - h_im * r_im - t_re
+        result_im = h_re * r_im + h_im * r_re - t_im
+        
+        # L2 norm of complex difference
+        distance = torch.sqrt(result_re**2 + result_im**2 + 1e-8).sum(dim=1)
+        return -distance
+
+    def score_hr_t(self, h, r, all_tails):
+        """
+        h, r: 1D tensors (typically length 1), all_tails: 1D tensor of tail IDs
+        return: 1D tensor of |all_tails| scores
+        """
+        # Expand h,r to match all_tails and call score_triple
+        H = h.expand_as(all_tails)
+        R = r.expand_as(all_tails)
+        return self.score_triple(H, R, all_tails)

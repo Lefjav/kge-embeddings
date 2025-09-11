@@ -17,11 +17,8 @@ from typing import Dict, Any
 import datetime
 
 FLAGS = flags.FLAGS
-flags.DEFINE_string("checkpoint_path", default="", help="Path to model checkpoint file")
-flags.DEFINE_string("dataset_path", default="./mitre_data", help="Path to dataset")
 flags.DEFINE_bool("analyze_direct_vs_transitive", default=True, help="Analyze direct vs transitive relationship performance")
 flags.DEFINE_bool("show_relation_confidence", default=True, help="Show confidence breakdown by relation type")
-flags.DEFINE_bool("use_gpu", default=True, help="Flag enabling gpu usage")
 flags.DEFINE_bool("type_constrained", default=True, help="Use type-constrained evaluation")
 flags.DEFINE_string("output_file", default="", help="Output file for results (default: auto-generated)")
 flags.DEFINE_string("query_cwe", default="", help="CWE ID to query for related CAPECs")
@@ -538,7 +535,7 @@ def main(_):
         id2rel[i] = r
     
     # Load test set
-    test_set = data.FB15KDataset(test_path, entity2id, relation2id)
+    test_set = data.MitreDataset(test_path, entity2id, relation2id)
     
     # Build filtered sets
     print("Building filtered evaluation sets...")
@@ -656,6 +653,37 @@ def main(_):
             # Save query results
             query_output_file = f"query_{model_type}_{FLAGS.query_cwe}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             save_query_results(query_results, FLAGS.query_cwe, FLAGS.query_relation, model_type, query_output_file)
+
+
+def rank_topk(model, h_str, r_str, e2id, r2id, k=10, filtered=True, all_true=None):
+    """Rank top-k entities for a given head-relation pair."""
+    device = next(model.parameters()).device
+    H = torch.tensor([e2id[h_str]], device=device)
+    R = torch.tensor([r2id[r_str]], device=device)
+    E = len(e2id)
+    tails = torch.arange(E, device=device)
+    scores = model.score_hr_t(H, R, tails)
+    
+    if filtered and all_true is not None:
+        h, r = H.item(), R.item()
+        # mask all true except the one we will read out
+        for tprime in range(E):
+            if (h, r, tprime) in all_true:
+                scores[tprime] = -1e9
+    
+    topk = torch.topk(scores, k)
+    inv_e = {v: k for k, v in e2id.items()}
+    return [(inv_e[idx.item()], scores[idx].item()) for idx in topk.indices]
+
+
+def predict_binary(model, triple_str, e2id, r2id, calibrator=None):
+    """Predict binary classification for a triple with optional calibration."""
+    h, r, t = triple_str
+    device = next(model.parameters()).device
+    s = model.score_triple(torch.tensor([e2id[h]], device=device),
+                           torch.tensor([r2id[r]], device=device),
+                           torch.tensor([e2id[t]], device=device)).item()
+    return {"score": s, "prob": (calibrator.transform([s])[0] if calibrator else None)}
 
 
 if __name__ == '__main__':
