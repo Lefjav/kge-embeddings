@@ -1,0 +1,64 @@
+================================================================================
+ComplEx Model Evaluation Results
+================================================================================
+Timestamp: 2025-09-12 15:46:01
+Dataset: ./mitre-data/txt
+Model: ComplEx
+
+Model Parameters:
+----------------------------------------
+model: ComplEx
+embedding_dim: 200
+margin: 12.0
+norm: 1
+lr: 0.001
+epochs: 1
+batch_size: 256
+neg_ratio: 32
+self_adversarial: True
+
+Regular Filtered Evaluation Results:
+----------------------------------------
+Tail Prediction:
+  H@1:  0.1706
+  H@3:  0.2970
+  H@10: 0.3903
+  MRR:  0.2555
+  Queries: 18919
+
+Head Prediction:
+  H@1:  0.1520
+  H@3:  0.2742
+  H@10: 0.3658
+  MRR:  0.2354
+  Queries: 18919
+
+Regular Average:
+  H@1:  0.1613
+  H@3:  0.2856
+  H@10: 0.3781
+  MRR:  0.2455
+
+Type-Constrained Filtered Evaluation Results:
+----------------------------------------
+Tail Prediction:
+  H@1:  0.1790
+  H@3:  0.3185
+  H@10: 0.4299
+  MRR:  0.2756
+  Queries: 18919
+
+Head Prediction:
+  H@1:  0.1610
+  H@3:  0.2979
+  H@10: 0.4090
+  MRR:  0.2570
+  Queries: 18919
+
+Type-Constrained Average:
+  H@1:  0.1700
+  H@3:  0.3082
+  H@10: 0.4194
+  MRR:  0.2663
+
+================================================================================

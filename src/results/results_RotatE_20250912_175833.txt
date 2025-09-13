@@ -1,0 +1,64 @@
+================================================================================
+RotatE Model Evaluation Results
+================================================================================
+Timestamp: 2025-09-12 17:58:33
+Dataset: ./mitre-data/txt
+Model: RotatE
+
+Model Parameters:
+----------------------------------------
+model: RotatE
+embedding_dim: 200
+margin: 12.0
+norm: 1
+lr: 0.001
+epochs: 4
+batch_size: 512
+neg_ratio: 64
+self_adversarial: True
+
+Regular Filtered Evaluation Results:
+----------------------------------------
+Tail Prediction:
+  H@1:  0.0801
+  H@3:  0.2513
+  H@10: 0.3722
+  MRR:  0.1939
+  Queries: 18919
+
+Head Prediction:
+  H@1:  0.0732
+  H@3:  0.2487
+  H@10: 0.3745
+  MRR:  0.1905
+  Queries: 18919
+
+Regular Average:
+  H@1:  0.0766
+  H@3:  0.2500
+  H@10: 0.3733
+  MRR:  0.1922
+
+Type-Constrained Filtered Evaluation Results:
+----------------------------------------
+Tail Prediction:
+  H@1:  0.1138
+  H@3:  0.3837
+  H@10: 0.4733
+  MRR:  0.2701
+  Queries: 18919
+
+Head Prediction:
+  H@1:  0.1061
+  H@3:  0.3819
+  H@10: 0.4795
+  MRR:  0.2669
+  Queries: 18919
+
+Type-Constrained Average:
+  H@1:  0.1100
+  H@3:  0.3828
+  H@10: 0.4764
+  MRR:  0.2685
+
+================================================================================

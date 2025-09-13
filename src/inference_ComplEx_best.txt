@@ -1,0 +1,53 @@
+================================================================================
+ComplEx Model Inference Results
+================================================================================
+Timestamp: 2025-09-12 12:54:11
+Dataset: ./mitre-data/txt
+Model: ComplEx
+Type-Constrained: True
+
+Regular Filtered Evaluation Results:
+----------------------------------------
+Tail Prediction:
+  H@1:  0.0038
+  H@3:  0.0076
+  H@10: 0.0198
+  MRR:  0.0138
+  Queries: 18919
+
+Head Prediction:
+  H@1:  0.0030
+  H@3:  0.0071
+  H@10: 0.0223
+  MRR:  0.0135
+  Queries: 18919
+
+Regular Average:
+  H@1:  0.0034
+  H@3:  0.0073
+  H@10: 0.0210
+  MRR:  0.0136
+
+Type-Constrained Filtered Evaluation Results:
+----------------------------------------
+Tail Prediction:
+  H@1:  0.0039
+  H@3:  0.0077
+  H@10: 0.0199
+  MRR:  0.0139
+  Queries: 18919
+
+Head Prediction:
+  H@1:  0.0030
+  H@3:  0.0071
+  H@10: 0.0223
+  MRR:  0.0135
+  Queries: 18919
+
+Type-Constrained Average:
+  H@1:  0.0034
+  H@3:  0.0074
+  H@10: 0.0211
+  MRR:  0.0137
+
+================================================================================

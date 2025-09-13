@@ -1,0 +1,53 @@
+================================================================================
+RotatE Model Inference Results
+================================================================================
+Timestamp: 2025-09-12 12:57:33
+Dataset: ./mitre-data/txt
+Model: RotatE
+Type-Constrained: True
+
+Regular Filtered Evaluation Results:
+----------------------------------------
+Tail Prediction:
+  H@1:  0.0025
+  H@3:  0.0066
+  H@10: 0.0215
+  MRR:  0.0131
+  Queries: 18919
+
+Head Prediction:
+  H@1:  0.0023
+  H@3:  0.0062
+  H@10: 0.0211
+  MRR:  0.0128
+  Queries: 18919
+
+Regular Average:
+  H@1:  0.0024
+  H@3:  0.0064
+  H@10: 0.0213
+  MRR:  0.0129
+
+Type-Constrained Filtered Evaluation Results:
+----------------------------------------
+Tail Prediction:
+  H@1:  0.0025
+  H@3:  0.0066
+  H@10: 0.0217
+  MRR:  0.0132
+  Queries: 18919
+
+Head Prediction:
+  H@1:  0.0023
+  H@3:  0.0062
+  H@10: 0.0211
+  MRR:  0.0129
+  Queries: 18919
+
+Type-Constrained Average:
+  H@1:  0.0024
+  H@3:  0.0064
+  H@10: 0.0214
+  MRR:  0.0130
+
+================================================================================

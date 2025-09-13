@@ -1,0 +1,64 @@
+================================================================================
+TransE Model Evaluation Results
+================================================================================
+Timestamp: 2025-09-12 16:29:54
+Dataset: ./mitre-data/txt
+Model: TransE
+
+Model Parameters:
+----------------------------------------
+model: TransE
+embedding_dim: 200
+margin: 12.0
+norm: 1
+lr: 0.001
+epochs: 4
+batch_size: 256
+neg_ratio: 32
+self_adversarial: True
+
+Regular Filtered Evaluation Results:
+----------------------------------------
+Tail Prediction:
+  H@1:  0.1085
+  H@3:  0.7232
+  H@10: 0.8432
+  MRR:  0.4346
+  Queries: 18919
+
+Head Prediction:
+  H@1:  0.1090
+  H@3:  0.7244
+  H@10: 0.8446
+  MRR:  0.4352
+  Queries: 18919
+
+Regular Average:
+  H@1:  0.1087
+  H@3:  0.7238
+  H@10: 0.8439
+  MRR:  0.4349
+
+Type-Constrained Filtered Evaluation Results:
+----------------------------------------
+Tail Prediction:
+  H@1:  0.1333
+  H@3:  0.7502
+  H@10: 0.8658
+  MRR:  0.4592
+  Queries: 18919
+
+Head Prediction:
+  H@1:  0.1333
+  H@3:  0.7505
+  H@10: 0.8679
+  MRR:  0.4591
+  Queries: 18919
+
+Type-Constrained Average:
+  H@1:  0.1333
+  H@3:  0.7504
+  H@10: 0.8669
+  MRR:  0.4591
+
+================================================================================

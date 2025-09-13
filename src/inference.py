@@ -6,8 +6,9 @@ Loads a checkpoint and evaluates on the test set.
 
 from absl import app
 from absl import flags
-import data
-import model as model_definition
+import data as data_module
+# Models are now imported from the models package
+from models import build_model
 import os
 import storage
 import torch
@@ -17,6 +18,13 @@ from typing import Dict, Any
 import datetime
 
 FLAGS = flags.FLAGS
+
+# Required flags
+flags.DEFINE_string("checkpoint_path", default="", help="Path to model checkpoint (.pt file)")
+flags.DEFINE_string("dataset_path", default="./mitre-data/txt", help="Path to dataset directory")
+flags.DEFINE_bool("use_gpu", default=True, help="Use GPU if available")
+
+# Optional flags
 flags.DEFINE_bool("analyze_direct_vs_transitive", default=True, help="Analyze direct vs transitive relationship performance")
 flags.DEFINE_bool("show_relation_confidence", default=True, help="Show confidence breakdown by relation type")
 flags.DEFINE_bool("type_constrained", default=True, help="Use type-constrained evaluation")
@@ -41,119 +49,101 @@ def build_known_sets_id(paths, entity2id, relation2id):
     return tails_by_hr, heads_by_rt
 
 
-def ranks_from_scores(scores, gold, smaller_is_better=True):
-    """Calculate ranks from scores using tie-safe counting method."""
-    gold_scores = scores[torch.arange(scores.size(0), device=scores.device), gold]
-    if smaller_is_better:
-        ranks = 1 + (scores < gold_scores.unsqueeze(1)).sum(dim=1)
-    else:
-        ranks = 1 + (scores > gold_scores.unsqueeze(1)).sum(dim=1)
-    return ranks
-
-
-def hits_at_k_from_ranks(ranks, k): 
-    """Calculate hits@k from ranks."""
-    return (ranks <= k).float().mean().item()
-
-
-def mrr_from_ranks(ranks): 
-    """Calculate MRR from ranks."""
-    return (1.0 / ranks.float()).mean().item()
 
 
 @torch.no_grad()
-def eval_tail_filtered(model, dataset, E, device, tails_by_hr, hier_rel_ids, etype_tensor=None, type_constrained=False):
-    """Efficient filtered tail evaluation."""
+def eval_tail_filtered(model, dataset, E, device, tails_by_hr,
+                       type_constrained=False, allowed_tails=None, hier_rel_ids=None):
+    """Efficient filtered tail evaluation - higher=better."""
     model.eval()
-    all_ranks = []
+    ranks = []
     for h, r, t in dataset:
-        # candidate mask
         mask = torch.ones(E, dtype=torch.bool, device=device)
-        # filter out other true tails
-        true_t = tails_by_hr.get((h, r), set())
-        if true_t:
-            mask[torch.tensor(list(true_t), device=device)] = False
-        # forbid self for hierarchical relations
-        if r in hier_rel_ids:
+        true = tails_by_hr.get((h,r), set())
+        if true:
+            mask[torch.tensor(list(true), device=device)] = False
+        if hier_rel_ids and r in hier_rel_ids:
             mask[h] = False
-        
-        # Type-constrained evaluation: same type as head for hierarchical relations
-        if type_constrained and etype_tensor is not None and r in hier_rel_ids:
-            head_type = etype_tensor[h]
-            mask = mask & (etype_tensor == head_type)
-        
-        # Always ensure gold is included AFTER type constraint
+        if type_constrained and allowed_tails is not None:
+            allowed = allowed_tails.get(r, None)
+            if allowed is not None and len(allowed) < E:
+                m2 = torch.zeros(E, dtype=torch.bool, device=device)
+                m2[torch.tensor(list(allowed), device=device)] = True
+                mask &= m2
         mask[t] = True
 
-        cand = torch.arange(E, device=device)[mask.to(device)]
-        bh = torch.full_like(cand, h, device=device)
-        br = torch.full_like(cand, r, device=device)
-        trip = torch.stack([bh, br, cand], dim=1)
-        d = model.predict(trip)
-
-        # dense vector with +inf elsewhere
-        vec = torch.full((E,), float("inf"), device=device)
-        vec[mask.to(device)] = d
-        # sanity: gold must be finite
-        assert torch.isfinite(vec[t]).item(), "Gold was filtered out!"
-
-        # rank for this query
-        rank = ranks_from_scores(vec.unsqueeze(0), torch.tensor([t], device=device), smaller_is_better=True)
-        all_ranks.append(rank)
-
-    ranks = torch.cat(all_ranks, dim=0)
+        cand = torch.arange(E, device=device)[mask]
+        s = model.score_triples(
+            torch.full_like(cand, h), torch.full_like(cand, r), cand
+        )
+        vec = torch.full((E,), float("-inf"), device=device); vec[mask] = s
+        # higher=better rank
+        gold = torch.tensor([t], device=device)
+        gold_s = vec[gold]
+        rank = 1 + (vec > gold_s).sum()
+        ranks.append(rank)
+        
+        # Sanity checks
+        assert torch.isfinite(vec[t]).item(), "Gold got masked!"
+        assert (rank >= 1).item() and (rank <= E).item(), f"Invalid rank: {rank}"
+        if type_constrained:
+            assert mask[t].item(), "Gold not re-included under type constraints"
     
+    ranks = torch.stack(ranks)
     return {
-        "MRR": mrr_from_ranks(ranks),
-        "H@1": hits_at_k_from_ranks(ranks, 1),
-        "H@3": hits_at_k_from_ranks(ranks, 3),
-        "H@10": hits_at_k_from_ranks(ranks, 10),
-        "num_queries": int(ranks.numel())
+        "MRR": float((1.0 / ranks.float()).mean().item()),
+        "H@1": float((ranks<=1).float().mean().item()),
+        "H@3": float((ranks<=3).float().mean().item()),
+        "H@10": float((ranks<=10).float().mean().item()),
+        "num_queries": int(ranks.numel()),
     }
 
 
 @torch.no_grad()
-def eval_head_filtered(model, dataset, E, device, heads_by_rt, hier_rel_ids, etype_tensor=None, type_constrained=False):
-    """Efficient filtered head evaluation."""
+def eval_head_filtered(model, dataset, E, device, heads_by_rt,
+                       type_constrained=False, allowed_heads=None, hier_rel_ids=None):
+    """Efficient filtered head evaluation - higher=better."""
     model.eval()
-    all_ranks = []
+    ranks = []
     for h, r, t in dataset:
         mask = torch.ones(E, dtype=torch.bool, device=device)
-        true_h = heads_by_rt.get((r, t), set())
-        if true_h:
-            mask[torch.tensor(list(true_h), device=device)] = False
-        if r in hier_rel_ids:
+        true = heads_by_rt.get((r,t), set())
+        if true:
+            mask[torch.tensor(list(true), device=device)] = False
+        if hier_rel_ids and r in hier_rel_ids:
             mask[t] = False
-        
-        # Type-constrained evaluation: same type as tail for hierarchical relations
-        if type_constrained and etype_tensor is not None and r in hier_rel_ids:
-            tail_type = etype_tensor[t]
-            mask = mask & (etype_tensor == tail_type)
-        
-        # Always ensure gold is included AFTER type constraint
+        if type_constrained and allowed_heads is not None:
+            allowed = allowed_heads.get(r, None)
+            if allowed is not None and len(allowed) < E:
+                m2 = torch.zeros(E, dtype=torch.bool, device=device)
+                m2[torch.tensor(list(allowed), device=device)] = True
+                mask &= m2
         mask[h] = True
 
-        cand = torch.arange(E, device=device)[mask.to(device)]
-        br = torch.full_like(cand, r, device=device)
-        bt = torch.full_like(cand, t, device=device)
-        trip = torch.stack([cand, br, bt], dim=1)
-        d = model.predict(trip)
-
-        vec = torch.full((E,), float("inf"), device=device)
-        vec[mask.to(device)] = d
-        assert torch.isfinite(vec[h]).item(), "Gold was filtered out!"
-
-        rank = ranks_from_scores(vec.unsqueeze(0), torch.tensor([h], device=device), smaller_is_better=True)
-        all_ranks.append(rank)
-
-    ranks = torch.cat(all_ranks, dim=0)
+        cand = torch.arange(E, device=device)[mask]
+        s = model.score_triples(
+            cand, torch.full_like(cand, r), torch.full_like(cand, t)
+        )
+        vec = torch.full((E,), float("-inf"), device=device); vec[mask] = s
+        # higher=better rank
+        gold = torch.tensor([h], device=device)
+        gold_s = vec[gold]
+        rank = 1 + (vec > gold_s).sum()
+        ranks.append(rank)
+        
+        # Sanity checks
+        assert torch.isfinite(vec[h]).item(), "Gold got masked!"
+        assert (rank >= 1).item() and (rank <= E).item(), f"Invalid rank: {rank}"
+        if type_constrained:
+            assert mask[h].item(), "Gold not re-included under type constraints"
     
+    ranks = torch.stack(ranks)
     return {
-        "MRR": mrr_from_ranks(ranks),
-        "H@1": hits_at_k_from_ranks(ranks, 1),
-        "H@3": hits_at_k_from_ranks(ranks, 3),
-        "H@10": hits_at_k_from_ranks(ranks, 10),
-        "num_queries": int(ranks.numel())
+        "MRR": float((1.0 / ranks.float()).mean().item()),
+        "H@1": float((ranks<=1).float().mean().item()),
+        "H@3": float((ranks<=3).float().mean().item()),
+        "H@10": float((ranks<=10).float().mean().item()),
+        "num_queries": int(ranks.numel()),
     }
 
 
@@ -162,7 +152,7 @@ def load_model_from_checkpoint(checkpoint_path: str, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
     # Extract model parameters from checkpoint
-    model_state = checkpoint["model_state_dict"]
+    model_state = checkpoint["model"]
     
     # Initialize default values
     model_type = "TransE"  # default fallback
@@ -171,63 +161,94 @@ def load_model_from_checkpoint(checkpoint_path: str, device: torch.device):
     dim = 50
     
     # Infer model type and parameters from the state dict
-    if "entities_emb.weight" in model_state:
-        entity_count = model_state["entities_emb.weight"].shape[0] - 1  # -1 for padding
-        relation_count = model_state["relations_emb.weight"].shape[0] - 1  # -1 for padding
-        dim = model_state["entities_emb.weight"].shape[1]
+    print(f"Available keys in checkpoint: {list(model_state.keys())}")
+    
+    if "ent.weight" in model_state:
+        entity_count = model_state["ent.weight"].shape[0]  # Keep original count (includes padding)
+        relation_count = model_state["rel.weight"].shape[0]  # Keep original count (includes padding)
+        ent_dim = model_state["ent.weight"].shape[1]
+        rel_dim = model_state["rel.weight"].shape[1]
         
-        # Determine model type based on relation embedding shape
-        if len(model_state["relations_emb.weight"].shape) == 2:
-            if model_state["relations_emb.weight"].shape[1] == dim:
-                model_type = "TransE"
-            elif model_state["relations_emb.weight"].shape[1] == dim * 2:
+        # Determine model type based on embedding dimensions
+        if ent_dim == rel_dim:
+            # Both have same dimension - could be TransE or ComplEx
+            if ent_dim % 2 == 0:
+                # Even dimension - likely ComplEx (real|imag)
                 model_type = "ComplEx"
+                dim = ent_dim // 2
+                print(f"Detected ComplEx: entities={entity_count}, relations={relation_count}, dim={dim}")
             else:
-                model_type = "RotatE"
+                # Odd dimension - likely TransE
+                model_type = "TransE"
+                dim = ent_dim
+                print(f"Detected TransE: entities={entity_count}, relations={relation_count}, dim={dim}")
         else:
-            model_type = "TransE"  # default fallback
+            # Different dimensions - likely RotatE (ent: dim*2, rel: dim)
+            model_type = "RotatE"
+            dim = rel_dim
+            print(f"Detected RotatE: entities={entity_count}, relations={relation_count}, dim={dim}")
+    elif "entities_emb.weight" in model_state:
+        entity_count = model_state["entities_emb.weight"].shape[0]  # Keep original count
+        relation_count = model_state["relations_emb.weight"].shape[0]  # Keep original count
+        dim = model_state["entities_emb.weight"].shape[1]
+        model_type = "TransE"  # Default for single embedding
+        print(f"Detected TransE (alt): entities={entity_count}, relations={relation_count}, dim={dim}")
+    elif "entities_emb_re.weight" in model_state:
+        entity_count = model_state["entities_emb_re.weight"].shape[0]  # Keep original count
+        relation_count = model_state["relations_emb_re.weight"].shape[0]  # Keep original count
+        dim = model_state["entities_emb_re.weight"].shape[1]
+        
+        # Check if it's ComplEx (has both real and imaginary relation embeddings)
+        if "relations_emb_im.weight" in model_state:
+            model_type = "ComplEx"
+            print(f"Detected ComplEx: entities={entity_count}, relations={relation_count}, dim={dim}")
+        else:
+            model_type = "RotatE"
+            print(f"Detected RotatE: entities={entity_count}, relations={relation_count}, dim={dim}")
     else:
         print("Warning: Could not detect model type from checkpoint, using TransE as default")
+        # Try to infer from available keys
+        if "entities_emb_re.weight" in model_state:
+            entity_count = model_state["entities_emb_re.weight"].shape[0]
+            relation_count = model_state["relations_emb.weight"].shape[0]
+            dim = model_state["entities_emb_re.weight"].shape[1]
+            model_type = "RotatE"
+            print(f"Fallback RotatE: entities={entity_count}, relations={relation_count}, dim={dim}")
+        else:
+            entity_count = 0
+            relation_count = 0
+            dim = 50
+            print(f"Fallback defaults: entities={entity_count}, relations={relation_count}, dim={dim}")
     
     print(f"Detected model type: {model_type}")
     print(f"Entity count: {entity_count}, Relation count: {relation_count}, Dimension: {dim}")
     
-    # Create model instance with correct dimensions
-    if model_type == "TransE":
-        model = model_definition.TransE(
-            entity_count=entity_count, 
-            relation_count=relation_count, 
-            dim=dim, 
-            margin=1.0, 
-            device=device, 
-            norm=1, 
-            use_soft_loss=True
-        )
-    elif model_type == "ComplEx":
-        model = model_definition.ComplEx(
-            entity_count=entity_count, 
-            relation_count=relation_count, 
-            dim=dim, 
-            margin=1.0, 
-            device=device, 
-            use_soft_loss=True
-        )
-    elif model_type == "RotatE":
-        model = model_definition.RotatE(
-            entity_count=entity_count, 
-            relation_count=relation_count, 
-            dim=dim, 
-            margin=1.0, 
-            device=device, 
-            use_soft_loss=True
-        )
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
+    # Create model instance with correct dimensions using build_model
+    model = build_model(
+        name=model_type,
+        num_entities=entity_count,
+        num_relations=relation_count,
+        dim=dim,
+        margin=1.0,
+        device=device
+    )
     
     # Verify dimensions match
     print(f"Model created with: {entity_count} entities, {relation_count} relations, dim={dim}")
-    print(f"Entity embedding shape: {model.entities_emb.weight.shape}")
-    print(f"Relation embedding shape: {model.relations_emb.weight.shape}")
+    if hasattr(model, 'ent'):
+        print(f"Entity embedding shape: {model.ent.weight.shape}")
+        print(f"Relation embedding shape: {model.rel.weight.shape}")
+    elif hasattr(model, 'entities_emb'):
+        print(f"Entity embedding shape: {model.entities_emb.weight.shape}")
+        print(f"Relation embedding shape: {model.relations_emb.weight.shape}")
+    elif hasattr(model, 'entities_emb_re'):
+        print(f"Entity embedding (real) shape: {model.entities_emb_re.weight.shape}")
+        print(f"Entity embedding (imag) shape: {model.entities_emb_im.weight.shape}")
+        if hasattr(model, 'relations_emb_re'):
+            print(f"Relation embedding (real) shape: {model.relations_emb_re.weight.shape}")
+            print(f"Relation embedding (imag) shape: {model.relations_emb_im.weight.shape}")
+        else:
+            print(f"Relation embedding shape: {model.relations_emb.weight.shape}")
     
     # Load the state dict
     model.load_state_dict(model_state)
@@ -271,12 +292,12 @@ def analyze_relation_type_performance(model, dataset, entity2id, relation2id, id
         t_tensor = torch.tensor(candidates, device=device)
         
         triplets = torch.stack([h_tensor, r_tensor, t_tensor], dim=1)
-        scores = model.predict(triplets)
+        scores = model.score_triples(triplets[:, 0], triplets[:, 1], triplets[:, 2])
         
         # Find rank of gold answer
         gold_idx = candidates.index(t)
         gold_score = scores[gold_idx]
-        better_scores = (scores < gold_score).sum().item()  # Lower score = better
+        better_scores = (scores > gold_score).sum().item()  # Higher score = better
         rank = better_scores + 1
         
         relation_performance[r_name]['queries'].append((h_name, r_name, t_name))
@@ -338,9 +359,9 @@ def query_cwe_to_capecs(model, cwe_id: str, relation: str, entity2id: Dict[str, 
     relation_tensor = torch.full_like(capec_entity_ids, relation_id, device=device)
     query_triplets = torch.stack([cwe_tensor, relation_tensor, capec_entity_ids], dim=1)
     
-    # Get prediction scores (lower is better for distance-based models)
+    # Get prediction scores (higher is better for score-based models)
     with torch.no_grad():
-        scores = model.predict(query_triplets)
+        scores = model.score_triples(query_triplets[:, 0], query_triplets[:, 1], query_triplets[:, 2])
     
     # Convert to confidence scores (higher is better)
     # For distance-based models, we convert distance to similarity
@@ -351,8 +372,8 @@ def query_cwe_to_capecs(model, cwe_id: str, relation: str, entity2id: Dict[str, 
     if std_score > 0:
         # Normalize using z-score and convert to confidence
         z_scores = (scores - mean_score) / std_score
-        # Convert to 0-1 range using sigmoid
-        confidence_scores = torch.sigmoid(-z_scores)  # Negative because lower distance = higher confidence
+        # Convert to 0-1 range using sigmoid (higher scores = higher confidence)
+        confidence_scores = torch.sigmoid(z_scores)
     else:
         confidence_scores = torch.ones_like(scores) * 0.5  # All equal if no variation
     
@@ -524,18 +545,14 @@ def main(_):
     validation_path = os.path.join(path, "valid.txt")
     test_path = os.path.join(path, "test.txt")
     
-    entity2id, relation2id = data.create_mappings_from_all(train_path, validation_path, test_path)
+    entity2id, relation2id = data_module.create_mappings_from_all(train_path, validation_path, test_path)
     
-    # Build inverse maps
-    id2entity = [None] * len(entity2id)
-    for e, i in entity2id.items(): 
-        id2entity[i] = e
-    id2rel = [None] * len(relation2id)
-    for r, i in relation2id.items(): 
-        id2rel[i] = r
+    # Build inverse maps (fast lookup)
+    id2entity = {i: s for s, i in entity2id.items()}
+    id2rel = {i: s for s, i in relation2id.items()}
     
     # Load test set
-    test_set = data.MitreDataset(test_path, entity2id, relation2id)
+    test_set = data_module.MitreDataset(test_path, entity2id, relation2id)
     
     # Build filtered sets
     print("Building filtered evaluation sets...")
@@ -565,10 +582,26 @@ def main(_):
     # Run inference
     print("=== RUNNING INFERENCE ===")
     
+    # Build type constraints for evaluation
+    from collections import defaultdict
+    allowed_heads = defaultdict(set)
+    allowed_tails = defaultdict(set)
+    train_triples = []
+    with open(train_path, "r", encoding="utf-8") as f:
+        for line in f:
+            h, r, t = line.rstrip("\n").split("\t")
+            if h in entity2id and r in relation2id and t in entity2id:
+                h_id, r_id, t_id = entity2id[h], relation2id[r], entity2id[t]
+                train_triples.append((h_id, r_id, t_id))
+                allowed_heads[r_id].add(h_id)
+                allowed_tails[r_id].add(t_id)
+
     # Regular filtered evaluation
     print("\n--- Regular Filtered Evaluation ---")
-    tail_results = eval_tail_filtered(model, test_set, len(entity2id), device, tails_by_hr, HIER_REL_IDS, etype_tensor, type_constrained=False)
-    head_results = eval_head_filtered(model, test_set, len(entity2id), device, heads_by_rt, HIER_REL_IDS, etype_tensor, type_constrained=False)
+    tail_results = eval_tail_filtered(model, test_set, len(entity2id), device, tails_by_hr, 
+                                     type_constrained=False, allowed_tails=allowed_tails, hier_rel_ids=HIER_REL_IDS)
+    head_results = eval_head_filtered(model, test_set, len(entity2id), device, heads_by_rt, 
+                                      type_constrained=False, allowed_heads=allowed_heads, hier_rel_ids=HIER_REL_IDS)
     
     print(f"Regular - Tail: H@1={tail_results['H@1']:.3f}, H@3={tail_results['H@3']:.3f}, H@10={tail_results['H@10']:.3f}, MRR={tail_results['MRR']:.3f}")
     print(f"Regular - Head: H@1={head_results['H@1']:.3f}, H@3={head_results['H@3']:.3f}, H@10={head_results['H@10']:.3f}, MRR={head_results['MRR']:.3f}")
@@ -589,8 +622,10 @@ def main(_):
     # Type-constrained evaluation (if requested)
     if FLAGS.type_constrained:
         print("\n--- Type-Constrained Filtered Evaluation ---")
-        tail_results_tc = eval_tail_filtered(model, test_set, len(entity2id), device, tails_by_hr, HIER_REL_IDS, etype_tensor, type_constrained=True)
-        head_results_tc = eval_head_filtered(model, test_set, len(entity2id), device, heads_by_rt, HIER_REL_IDS, etype_tensor, type_constrained=True)
+        tail_results_tc = eval_tail_filtered(model, test_set, len(entity2id), device, tails_by_hr, 
+                                           type_constrained=True, allowed_tails=allowed_tails, hier_rel_ids=HIER_REL_IDS)
+        head_results_tc = eval_head_filtered(model, test_set, len(entity2id), device, heads_by_rt, 
+                                            type_constrained=True, allowed_heads=allowed_heads, hier_rel_ids=HIER_REL_IDS)
         
         print(f"Type-Constrained - Tail: H@1={tail_results_tc['H@1']:.3f}, H@3={tail_results_tc['H@3']:.3f}, H@10={tail_results_tc['H@10']:.3f}, MRR={tail_results_tc['MRR']:.3f}")
         print(f"Type-Constrained - Head: H@1={head_results_tc['H@1']:.3f}, H@3={head_results_tc['H@3']:.3f}, H@10={head_results_tc['H@10']:.3f}, MRR={head_results_tc['MRR']:.3f}")
@@ -662,7 +697,7 @@ def rank_topk(model, h_str, r_str, e2id, r2id, k=10, filtered=True, all_true=Non
     R = torch.tensor([r2id[r_str]], device=device)
     E = len(e2id)
     tails = torch.arange(E, device=device)
-    scores = model.score_hr_t(H, R, tails)
+    scores = model.score_triples(H, R, tails)
     
     if filtered and all_true is not None:
         h, r = H.item(), R.item()
@@ -680,7 +715,7 @@ def predict_binary(model, triple_str, e2id, r2id, calibrator=None):
     """Predict binary classification for a triple with optional calibration."""
     h, r, t = triple_str
     device = next(model.parameters()).device
-    s = model.score_triple(torch.tensor([e2id[h]], device=device),
+    s = model.score_triples(torch.tensor([e2id[h]], device=device),
                            torch.tensor([r2id[r]], device=device),
                            torch.tensor([e2id[t]], device=device)).item()
     return {"score": s, "prob": (calibrator.transform([s])[0] if calibrator else None)}

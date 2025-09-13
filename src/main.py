@@ -1,7 +1,7 @@
 from absl import app
 from absl import flags
 import data
-import model as model_definition
+from models import build_model
 import os
 import storage
 import torch
@@ -9,31 +9,66 @@ import torch.optim as optim
 from torch.utils import data as torch_data
 from torch.utils import tensorboard
 from collections import defaultdict
+import time
+import json
+import math
 
 FLAGS = flags.FLAGS
-flags.DEFINE_float("lr", default=0.01, help="Learning rate value.")
+
+
+def save_ckpt(state, path):
+    """Save checkpoint with automatic directory creation."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(state, path)
+
+
+def load_ckpt(path, model, optimizer=None, map_location="cpu"):
+    """Load checkpoint and return epoch and best_tc_mrr."""
+    chk = torch.load(path, map_location=map_location)
+    model.load_state_dict(chk["model"])
+    if optimizer and "optim" in chk:
+        optimizer.load_state_dict(chk["optim"])
+    return chk.get("epoch", 0), chk.get("best_tc_mrr", None)
+
+
+# Core model parameters
+flags.DEFINE_enum("model", default="TransE", enum_values=["TransE", "RotatE", "ComplEx", "ConvE", "ConvTransE"], 
+                  help="Model to use: TransE, RotatE, ComplEx, ConvE, or ConvTransE")
+flags.DEFINE_integer("embedding_dim", default=200, help="Embedding dimension for entities and relations")
+flags.DEFINE_float("margin", default=12.0, help="Margin value for TransE/RotatE margin-ranking loss")
+flags.DEFINE_enum("loss", default="margin", enum_values=["margin", "bce"], help="Loss function: margin or binary cross-entropy")
+flags.DEFINE_integer("neg_ratio", default=64, help="Number of negatives per positive")
+flags.DEFINE_float("lr", default=1e-3, help="Learning rate value")
+flags.DEFINE_integer("epochs", default=200, help="Number of training epochs")
+flags.DEFINE_integer("batch_size", default=1024, help="Batch size for training")
+flags.DEFINE_integer("eval_every", default=2, help="Validate every N epochs")
+flags.DEFINE_bool("eval_filtered", default=True, help="Use filtered ranking metrics")
+flags.DEFINE_integer("early_stop_patience", default=6, help="Stop if no TC-MRR improvement for this many validations")
+flags.DEFINE_float("early_stop_delta", default=0.002, help="Minimal improvement in TC-MRR to reset patience")
+flags.DEFINE_string("checkpoint_dir", default="./checkpoints", help="Root folder for checkpoints/<ModelName>")
+flags.DEFINE_string("results_dir", default="./results", help="Where to write results_*.txt")
+flags.DEFINE_bool("nouse_gpu", default=False, help="Disable GPU usage")
+flags.DEFINE_string("resume", default="", help="Path to a checkpoint (.pt) to resume from")
+
+# ConvE/ConvTransE specific parameters
+flags.DEFINE_integer("conve_hidden_channels", default=32, help="Hidden channels for ConvE")
+flags.DEFINE_float("conve_dropout", default=0.2, help="Dropout rate for ConvE")
+flags.DEFINE_integer("convtranse_kernel_size", default=3, help="Kernel size for ConvTransE")
+flags.DEFINE_integer("convtranse_channels", default=32, help="Number of channels for ConvTransE")
+
+# Additional parameters
 flags.DEFINE_integer("seed", default=1234, help="Seed value.")
-flags.DEFINE_integer("batch_size", default=256, help="Maximum batch size (increased for faster training).")
 flags.DEFINE_integer("validation_batch_size", default=64, help="Maximum batch size during model validation.")
-flags.DEFINE_integer("vector_length", default=50, help="Length of entity/relation vector.")
-flags.DEFINE_float("margin", default=1.0, help="Margin value in margin-based ranking loss.")
 flags.DEFINE_integer("norm", default=1, help="Norm used for calculating dissimilarity metric (usually 1 or 2).")
-flags.DEFINE_integer("epochs", default=500, help="Number of training epochs (reduced for faster training).")
 flags.DEFINE_string("dataset_path", default="./mitre-data/txt",
                     help="Path to TXT splits: train.txt/valid.txt/test.txt")
 flags.DEFINE_bool("multi_hop_aware", default=True, help="Use multi-hop aware training techniques.")
 flags.DEFINE_float("direct_relation_weight", default=2.0, help="Weight boost for direct CWE-CAPEC relationships.")
 flags.DEFINE_bool("relation_aware_negatives", default=True, help="Use relation-aware negative sampling (now optimized).")
-flags.DEFINE_bool("use_gpu", default=True, help="Flag enabling gpu usage.")
-flags.DEFINE_integer("validation_freq", default=10, help="Validate model every X epochs.")
-flags.DEFINE_string("checkpoint_path", default="", help="Path to model checkpoint (by default train from scratch).")
 flags.DEFINE_string("tensorboard_log_dir", default="./runs", help="Path for tensorboard log directory.")
-flags.DEFINE_integer("num_negs", default=256, help="Number of negatives per positive.")
 flags.DEFINE_bool("self_adversarial", default=True, help="Use self-adversarial weighting for negatives.")
-flags.DEFINE_string("model", default="TransE", help="Model to use: TransE, ComplEx, or RotatE")
 
 # add eval & calibration toggles
-flags.DEFINE_bool("eval_filtered", default=True, help="Use filtered ranking metrics")
 flags.DEFINE_bool("eval_per_relation", default=True, help="Report per-relation metrics")
 flags.DEFINE_bool("eval_type_constrained", default=True, help="Apply type-domain/range masks in eval")
 flags.DEFINE_string("calibration", default="none",
@@ -86,24 +121,149 @@ def bernoulli_p(triples):
     return p
 
 
-def ranks_from_scores(scores, gold, smaller_is_better=True):
-    """Calculate ranks from scores using tie-safe counting method."""
-    gold_scores = scores[torch.arange(scores.size(0), device=scores.device), gold]
-    if smaller_is_better:
-        ranks = 1 + (scores < gold_scores.unsqueeze(1)).sum(dim=1)
+# Import the unified rank helper from metric.py
+from metric import ranks_from_scores
+
+
+
+
+# Unfiltered evaluation function
+def eval_tail_unfiltered(model, dataset, E, device, hier_rel_ids, etype_tensor=None, type_constrained=False, allowed_tails=None):
+    """Unfiltered tail evaluation - no masking of true triples."""
+    model.eval()
+    all_ranks = []
+    for h, r, t in dataset:
+        # No filtering - evaluate against all entities
+        cand = torch.arange(E, device=device)
+        bh = torch.full_like(cand, h, device=device)
+        br = torch.full_like(cand, r, device=device)
+        trip = torch.stack([bh, br, cand], dim=1)
+        scores = model.score_triples(trip[:, 0], trip[:, 1], trip[:, 2])
+        
+        # Type-constrained evaluation: use train-observed tail ranges per relation
+        if type_constrained and allowed_tails is not None:
+            allowed = allowed_tails.get(r, None)
+            if allowed is not None and len(allowed) < E:
+                # Only allow entities that appeared as tails for this relation in training
+                mask = torch.tensor([i in allowed for i in range(E)], device=device)
+                scores = torch.where(mask, scores, torch.tensor(float("-inf"), device=device))
+        
+        # rank for this query (higher=better)
+        rank = ranks_from_scores(scores.unsqueeze(0), torch.tensor([t], device=device))
+        all_ranks.append(rank)
+        
+        # Sanity checks
+        assert (rank >= 1).all() and (rank <= E).all(), f"Invalid rank: {rank}"
+
+    ranks = torch.cat(all_ranks, dim=0)
+    
+    return {
+        "MRR": float((1.0 / ranks.float()).mean().item()),
+        "H@1": float((ranks <= 1).float().mean().item()),
+        "H@3": float((ranks <= 3).float().mean().item()),
+        "H@10": float((ranks <= 10).float().mean().item()),
+        "num_queries": int(ranks.numel())
+    }
+
+
+def eval_head_unfiltered(model, dataset, E, device, hier_rel_ids, etype_tensor=None, type_constrained=False, allowed_heads=None):
+    """Unfiltered head evaluation - no masking of true triples."""
+    model.eval()
+    all_ranks = []
+    for h, r, t in dataset:
+        # No filtering - evaluate against all entities
+        cand = torch.arange(E, device=device)
+        br = torch.full_like(cand, r, device=device)
+        bt = torch.full_like(cand, t, device=device)
+        trip = torch.stack([cand, br, bt], dim=1)
+        scores = model.score_triples(trip[:, 0], trip[:, 1], trip[:, 2])
+        
+        # Type-constrained evaluation: use train-observed head ranges per relation
+        if type_constrained and allowed_heads is not None:
+            allowed = allowed_heads.get(r, None)
+            if allowed is not None and len(allowed) < E:
+                # Only allow entities that appeared as heads for this relation in training
+                mask = torch.tensor([i in allowed for i in range(E)], device=device)
+                scores = torch.where(mask, scores, torch.tensor(float("-inf"), device=device))
+        
+        # rank for this query (higher=better)
+        rank = ranks_from_scores(scores.unsqueeze(0), torch.tensor([h], device=device))
+        all_ranks.append(rank)
+        
+        # Sanity checks
+        assert (rank >= 1).all() and (rank <= E).all(), f"Invalid rank: {rank}"
+
+    ranks = torch.cat(all_ranks, dim=0)
+    
+    return {
+        "MRR": float((1.0 / ranks.float()).mean().item()),
+        "H@1": float((ranks <= 1).float().mean().item()),
+        "H@3": float((ranks <= 3).float().mean().item()),
+        "H@10": float((ranks <= 10).float().mean().item()),
+        "num_queries": int(ranks.numel())
+    }
+
+
+def evaluate_all(model, dataset, E, device, tails_by_hr, heads_by_rt, hier_rel_ids, etype_tensor=None, allowed_tails=None, allowed_heads=None, eval_filtered=True):
+    """
+    Unified evaluation function that returns both filtered and type-constrained filtered results.
+    
+    Returns a dict:
+    {
+      "filtered": {"tail": {...}, "head": {...}, "average": {...}},
+      "tc_filtered": {"tail": {...}, "head": {...}, "average": {...}}
+    }
+    """
+    model.eval()
+    
+    # Run filtered evaluation (both regular and type-constrained)
+    if eval_filtered:
+        tail_results_filtered = eval_tail_filtered(model, dataset, E, device, tails_by_hr, hier_rel_ids, etype_tensor, type_constrained=False, allowed_tails=allowed_tails)
+        head_results_filtered = eval_head_filtered(model, dataset, E, device, heads_by_rt, hier_rel_ids, etype_tensor, type_constrained=False, allowed_heads=allowed_heads)
+        
+        tail_results_tc = eval_tail_filtered(model, dataset, E, device, tails_by_hr, hier_rel_ids, etype_tensor, type_constrained=True, allowed_tails=allowed_tails)
+        head_results_tc = eval_head_filtered(model, dataset, E, device, heads_by_rt, hier_rel_ids, etype_tensor, type_constrained=True, allowed_heads=allowed_heads)
     else:
-        ranks = 1 + (scores > gold_scores.unsqueeze(1)).sum(dim=1)
-    return ranks
-
-
-def hits_at_k_from_ranks(ranks, k): 
-    """Calculate hits@k from ranks."""
-    return (ranks <= k).float().mean().item()
-
-
-def mrr_from_ranks(ranks): 
-    """Calculate MRR from ranks."""
-    return (1.0 / ranks.float()).mean().item()
+        tail_results_filtered = eval_tail_unfiltered(model, dataset, E, device, hier_rel_ids, etype_tensor, type_constrained=False, allowed_tails=allowed_tails)
+        head_results_filtered = eval_head_unfiltered(model, dataset, E, device, hier_rel_ids, etype_tensor, type_constrained=False, allowed_heads=allowed_heads)
+        
+        tail_results_tc = eval_tail_unfiltered(model, dataset, E, device, hier_rel_ids, etype_tensor, type_constrained=True, allowed_tails=allowed_tails)
+        head_results_tc = eval_head_unfiltered(model, dataset, E, device, hier_rel_ids, etype_tensor, type_constrained=True, allowed_heads=allowed_heads)
+    
+    # Calculate averages for filtered results
+    avg_hits_1_filtered = (tail_results_filtered["H@1"] + head_results_filtered["H@1"]) / 2
+    avg_hits_3_filtered = (tail_results_filtered["H@3"] + head_results_filtered["H@3"]) / 2
+    avg_hits_10_filtered = (tail_results_filtered["H@10"] + head_results_filtered["H@10"]) / 2
+    avg_mrr_filtered = (tail_results_filtered["MRR"] + head_results_filtered["MRR"]) / 2
+    
+    # Calculate averages for type-constrained filtered results
+    avg_hits_1_tc = (tail_results_tc["H@1"] + head_results_tc["H@1"]) / 2
+    avg_hits_3_tc = (tail_results_tc["H@3"] + head_results_tc["H@3"]) / 2
+    avg_hits_10_tc = (tail_results_tc["H@10"] + head_results_tc["H@10"]) / 2
+    avg_mrr_tc = (tail_results_tc["MRR"] + head_results_tc["MRR"]) / 2
+    
+    return {
+        "filtered": {
+            "tail": tail_results_filtered,
+            "head": head_results_filtered,
+            "average": {
+                "MRR": avg_mrr_filtered,
+                "H@1": avg_hits_1_filtered,
+                "H@3": avg_hits_3_filtered,
+                "H@10": avg_hits_10_filtered
+            }
+        },
+        "tc_filtered": {
+            "tail": tail_results_tc,
+            "head": head_results_tc,
+            "average": {
+                "MRR": avg_mrr_tc,
+                "H@1": avg_hits_1_tc,
+                "H@3": avg_hits_3_tc,
+                "H@10": avg_hits_10_tc
+            }
+        }
+    }
 
 
 # Fix for eval_tail_filtered function
@@ -132,26 +292,40 @@ def eval_tail_filtered(model, dataset, E, device, tails_by_hr, hier_rel_ids, ety
         # CRITICAL FIX: Always ensure gold is included AFTER type constraint
         mask[t] = True
 
+        # TC baseline debug (only when type_constrained)
+        if type_constrained and allowed_tails is not None:
+            allowed = allowed_tails.get(r, None)
+            if allowed:
+                tc_rand_h10 = min(10, len(allowed)) / len(allowed)
+                # (log occasionally; e.g., once per 1000 queries)
+                if len(all_ranks) % 1000 == 0:
+                    print(f"[TC DEBUG] Query {len(all_ranks)}: r={r}, allowed_tails={len(allowed)}, tc_rand_h10={tc_rand_h10:.3f}")
+
         cand = torch.arange(E, device=device)[mask.to(device)]
         bh = torch.full_like(cand, h, device=device)
         br = torch.full_like(cand, r, device=device)
         trip = torch.stack([bh, br, cand], dim=1)
-        d = model.predict(trip)                               # distances; smaller=better
+        scores = model.score_triples(trip[:, 0], trip[:, 1], trip[:, 2])  # scores; higher=better
 
-        # dense vector with +inf elsewhere
-        vec = torch.full((E,), float("inf"), device=device)
-        vec[mask.to(device)] = d
+        # dense vector with -inf elsewhere (since higher scores are better)
+        vec = torch.full((E,), float("-inf"), device=device)
+        vec[mask.to(device)] = scores
         # sanity: gold must be finite
         assert torch.isfinite(vec[t]).item(), "Gold was filtered out!"
 
-        # rank for this query
-        rank = ranks_from_scores(vec.unsqueeze(0), torch.tensor([t], device=device), smaller_is_better=True)
+        # rank for this query (higher=better)
+        rank = ranks_from_scores(vec.unsqueeze(0), torch.tensor([t], device=device))
         all_ranks.append(rank)
+        
+        # Sanity checks
+        assert (rank >= 1).all() and (rank <= E).all(), f"Invalid rank: {rank}"
+        if type_constrained:
+            assert mask[t].item(), "Gold not re-included under type constraints"
 
     ranks = torch.cat(all_ranks, dim=0)
     
     # Evaluation guardrails
-    h10_result = hits_at_k_from_ranks(ranks, 10)
+    h10_result = float((ranks <= 10).float().mean().item())
     assert h10_result >= 0.0, "H@10 should be non-negative"
     
     # Random baseline sanity check
@@ -161,9 +335,9 @@ def eval_tail_filtered(model, dataset, E, device, tails_by_hr, hier_rel_ids, ety
         print(f"Tail eval: avg_candidates={avg_cands:.1f}, random_H@10~{rand_h10:.3f}, actual_H@10={h10_result:.3f}")
     
     return {
-        "MRR": mrr_from_ranks(ranks),
-        "H@1": hits_at_k_from_ranks(ranks, 1),
-        "H@3": hits_at_k_from_ranks(ranks, 3),
+        "MRR": float((1.0 / ranks.float()).mean().item()),
+        "H@1": float((ranks <= 1).float().mean().item()),
+        "H@3": float((ranks <= 3).float().mean().item()),
         "H@10": h10_result,
         "num_queries": int(ranks.numel())
     }
@@ -192,23 +366,37 @@ def eval_head_filtered(model, dataset, E, device, heads_by_rt, hier_rel_ids, ety
         # CRITICAL FIX: Always ensure gold is included AFTER type constraint
         mask[h] = True
 
+        # TC baseline debug (only when type_constrained)
+        if type_constrained and allowed_heads is not None:
+            allowed = allowed_heads.get(r, None)
+            if allowed:
+                tc_rand_h10 = min(10, len(allowed)) / len(allowed)
+                # (log occasionally; e.g., once per 1000 queries)
+                if len(all_ranks) % 1000 == 0:
+                    print(f"[TC DEBUG] Query {len(all_ranks)}: r={r}, allowed_heads={len(allowed)}, tc_rand_h10={tc_rand_h10:.3f}")
+
         cand = torch.arange(E, device=device)[mask.to(device)]
         br = torch.full_like(cand, r, device=device)
         bt = torch.full_like(cand, t, device=device)
         trip = torch.stack([cand, br, bt], dim=1)
-        d = model.predict(trip)
+        scores = model.score_triples(trip[:, 0], trip[:, 1], trip[:, 2])  # scores; higher=better
 
-        vec = torch.full((E,), float("inf"), device=device)
-        vec[mask.to(device)] = d
+        vec = torch.full((E,), float("-inf"), device=device)
+        vec[mask.to(device)] = scores
         assert torch.isfinite(vec[h]).item(), "Gold was filtered out!"
 
-        rank = ranks_from_scores(vec.unsqueeze(0), torch.tensor([h], device=device), smaller_is_better=True)
+        rank = ranks_from_scores(vec.unsqueeze(0), torch.tensor([h], device=device))
         all_ranks.append(rank)
+        
+        # Sanity checks
+        assert (rank >= 1).all() and (rank <= E).all(), f"Invalid rank: {rank}"
+        if type_constrained:
+            assert mask[h].item(), "Gold not re-included under type constraints"
 
     ranks = torch.cat(all_ranks, dim=0)
     
     # Evaluation guardrails
-    h10_result = hits_at_k_from_ranks(ranks, 10)
+    h10_result = float((ranks <= 10).float().mean().item())
     assert h10_result >= 0.0, "H@10 should be non-negative"
     
     # Random baseline sanity check
@@ -218,9 +406,9 @@ def eval_head_filtered(model, dataset, E, device, heads_by_rt, hier_rel_ids, ety
         print(f"Head eval: avg_candidates={avg_cands:.1f}, random_H@10~{rand_h10:.3f}, actual_H@10={h10_result:.3f}")
     
     return {
-        "MRR": mrr_from_ranks(ranks),
-        "H@1": hits_at_k_from_ranks(ranks, 1),
-        "H@3": hits_at_k_from_ranks(ranks, 3),
+        "MRR": float((1.0 / ranks.float()).mean().item()),
+        "H@1": float((ranks <= 1).float().mean().item()),
+        "H@3": float((ranks <= 3).float().mean().item()),
         "H@10": h10_result,
         "num_queries": int(ranks.numel())
     }
@@ -228,88 +416,6 @@ def eval_head_filtered(model, dataset, E, device, heads_by_rt, hier_rel_ids, ety
 
 
 
-def sample_negatives_hr(h, r, t, all_entities, pos_set, twohop_map, k):
-    """Sample k negative triples with 50/50 head-vs-tail corruption and 2-hop awareness.
-    
-    This balanced approach helps both head and tail prediction performance, addressing
-    the common issue where head metrics lag due to tail-only corruption during training.
-    """
-    import random
-    keep_twohop = FLAGS.twohop_keep_ratio  # e.g., 0.2
-    direct_scope = (FLAGS.twohop_scope != "none")  # quick check
-    negs = []
-    while len(negs) < k:
-        if random.random() < 0.5:        # Bernoulli already computed? then use its p[r] if available
-            # tail corruption
-            t_neg = random.choice(all_entities)
-            if (h, r, t_neg) in pos_set: 
-                continue
-            if direct_scope and t_neg in twohop_map.get((h, r), ()):
-                if random.random() > keep_twohop:
-                    continue
-            negs.append((h, r, t_neg))
-        else:
-            # head corruption
-            h_neg = random.choice(all_entities)
-            if (h_neg, r, t) in pos_set:
-                continue
-            negs.append((h_neg, r, t))
-    return negs
-
-
-def generate_relation_aware_negatives(pos, entity2id, relation2id, id2rel, device, num_negs, p_tail_id, twohop_map=None, all_true=None):
-    """Generate negatives that challenge direct vs transitive reasoning - with 2-hop awareness."""
-    B = pos.size(0)
-    
-    # If we have 2-hop map and all_true set, use the new balanced sampling
-    if FLAGS.multi_hop_aware and twohop_map is not None and all_true is not None:
-        all_entities = list(range(len(entity2id)))
-        neg_list = []
-        
-        for i in range(B):
-            h_id = pos[i, 0].item()
-            r_id = pos[i, 1].item()
-            t_id = pos[i, 2].item()
-            
-            # Sample negatives with 50/50 head-vs-tail corruption and 2-hop awareness
-            negs = sample_negatives_hr(h_id, r_id, t_id, all_entities, all_true, twohop_map, num_negs)
-            neg_list.extend(negs)
-        
-        # Convert to tensor format
-        neg_tensor = torch.tensor(neg_list, device=device)
-        return neg_tensor
-    
-    # Fallback to standard Bernoulli corruption
-    rep = pos.repeat_interleave(num_negs, dim=0)  # [B*num_negs, 3]
-    r_flat = rep[:, 1]
-    p = p_tail_id[r_flat]
-    coin = (torch.rand_like(p) > p).long()
-    rand_e = torch.randint(len(entity2id), (B*num_negs,), device=device)
-    rep[:, 0] = torch.where(coin==1, rand_e, rep[:, 0])
-    rep[:, 2] = torch.where(coin==0, rand_e, rep[:, 2])
-    
-    return rep
-
-
-# Removed generate_challenging_negatives - too slow, using standard corruption instead
-
-
-def apply_multi_hop_aware_weighting(loss, pos, direct_rel_ids, path_rel_ids, direct_weight):
-    """Apply higher weights to direct relationship losses - OPTIMIZED."""
-    weights = torch.ones_like(loss)
-    
-    # Vectorized operations instead of Python loops
-    r_ids = pos[:, 1]
-    
-    # Create boolean masks for different relation types
-    direct_mask = torch.isin(r_ids, direct_rel_ids)
-    path_mask = torch.isin(r_ids, path_rel_ids)
-    
-    # Apply weights vectorized
-    weights[direct_mask] = direct_weight
-    weights[path_mask] = 0.5
-    
-    return loss * weights
 
 
 def main(_):
@@ -317,13 +423,17 @@ def main(_):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    # Core parameters
     batch_size = FLAGS.batch_size
-    vector_length = FLAGS.vector_length
+    vector_length = FLAGS.embedding_dim
     margin = FLAGS.margin
     norm = FLAGS.norm
     epochs = FLAGS.epochs
-    device = torch.device('cuda' if FLAGS.use_gpu and torch.cuda.is_available() else 'cpu')
-    if FLAGS.use_gpu and not torch.cuda.is_available():
+    
+    # GPU settings
+    use_gpu = not FLAGS.nouse_gpu
+    device = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')
+    if use_gpu and not torch.cuda.is_available():
         print("Warning: CUDA requested but not available. Using CPU instead.")
         
     # --- MITRE TXT loading and precompute helpers ---
@@ -338,6 +448,22 @@ def main(_):
     print(f"[DATA] Train={len(train_triples)} Valid={len(valid_triples)} Test={len(test_triples)} "
           f"Entities={len(e2id)} Relations={len(r2id)}")
 
+    # Import model factory and build model
+    from models import build_model
+    
+    model = build_model(
+        name=FLAGS.model,
+        num_entities=len(e2id),
+        num_relations=len(r2id),
+        dim=FLAGS.embedding_dim,
+        margin=FLAGS.margin,
+        conve_hidden_channels=FLAGS.conve_hidden_channels,
+        conve_dropout=FLAGS.conve_dropout,
+        convtranse_kernel_size=FLAGS.convtranse_kernel_size,
+        convtranse_channels=FLAGS.convtranse_channels,
+        device=('cpu' if FLAGS.nouse_gpu else 'cuda')
+    )
+
     # 1.5) Create inverse maps
     id2entity = [None] * len(e2id)
     for e, i in e2id.items(): 
@@ -346,6 +472,18 @@ def main(_):
     for r, i in r2id.items(): 
         id2rel[i] = r
 
+    # Create dictionary version for categorization
+    id2rel_dict = {i: r for r, i in r2id.items()}
+
+    # Use NAME-BASED categorization for reporting (stable & matches your printouts)
+    from data import categorize_relations_by_name
+    rel_category = categorize_relations_by_name(id2rel_dict)
+
+    # Replace ALL older prints with this single line:
+    num_direct = sum(v=='direct' for v in rel_category.values())
+    num_hier   = sum(v=='hier'   for v in rel_category.values())
+    num_other  = sum(v=='other'  for v in rel_category.values())
+    print(f"Relation categories by name: direct={num_direct}, hier={num_hier}, other={num_other}")
 
     # Create dataset paths for the old MitreDataset class
     path = FLAGS.dataset_path
@@ -354,7 +492,12 @@ def main(_):
     test_path = os.path.join(path, "test.txt")
     
     train_set = data.MitreDataset(train_path, e2id, r2id)
-    train_generator = torch_data.DataLoader(train_set, batch_size=batch_size)
+    train_generator = torch_data.DataLoader(
+        train_set, 
+        batch_size=batch_size,
+        num_workers=4 if not FLAGS.nouse_gpu else 0,
+        pin_memory=not FLAGS.nouse_gpu
+    )
     validation_set = data.MitreDataset(validation_path, e2id, r2id)
     test_set = data.MitreDataset(test_path, e2id, r2id)
     
@@ -407,15 +550,7 @@ def main(_):
         else:
             e2type[eid] = "CWE"  # default to CWE type
     
-    # Categorize relations
-    from data import categorize_relations
-    rel_category = categorize_relations(train_triples, e2type, r2id)
-    
-    # Count relations by category
-    direct_count = sum(1 for cat in rel_category.values() if cat == "direct")
-    hier_count = sum(1 for cat in rel_category.values() if cat == "hier")
-    path_count = sum(1 for cat in rel_category.values() if cat == "path")
-    print(f"Relation categories: {direct_count} direct, {hier_count} hierarchical, {path_count} path")
+    # Note: Using name-based categorization instead of data-driven categorization
     
     # Build allowed heads/tails for type-constrained evaluation
     from collections import defaultdict
@@ -426,24 +561,25 @@ def main(_):
         allowed_tails[r].add(t)
     print(f"Built type constraints: {len(allowed_heads)} relations with head constraints, {len(allowed_tails)} relations with tail constraints")
     
-    # Schema-aware hierarchical relations and CWE-CAPEC specific relations
-    HIER_NAMES = {"is_child_of", "has_child", "is_parent_of", "has_parent", "parent_of", "child_of", "subclass_of", "superclass_of", "related_to"}
-    CWE_CAPEC_NAMES = {"has_attack_pattern", "exploits_weakness", "related_to"}
-    ALL_REL_NAMES = HIER_NAMES | CWE_CAPEC_NAMES
-    HIER_REL_IDS = {r2id[r] for r in r2id if r in ALL_REL_NAMES}
+    # Print allowed-tail sizes per relation (explains easy H@10)
+    sizes = {rid: len(s) for rid, s in allowed_tails.items()}
+    def _stats(msk): 
+        arr = [sizes[rid] for rid, cat in rel_category.items() if msk(cat) and rid in sizes]
+        if not arr: return "n/a"
+        import numpy as np; arr = np.array(arr)
+        return f"min={arr.min()} med={np.median(arr):.1f} mean={arr.mean():.1f} max={arr.max()}"
+    print("[Allowed tail sizes] direct:", _stats(lambda c: c=='direct'),
+          "| hier:", _stats(lambda c: c=='hier'),
+          "| other:", _stats(lambda c: c=='other'))
     
-    # Precompute relation ID sets for fast multi-hop aware weighting using categorized relations
-    DIRECT_REL_IDS = torch.tensor([r_id for r_id, cat in rel_category.items() if cat == "direct"], device=device)
-    PATH_REL_IDS = torch.tensor([r_id for r_id, cat in rel_category.items() if cat == "path"], device=device)
-    HIER_REL_IDS_CAT = {r_id for r_id, cat in rel_category.items() if cat == "hier"}
-    
-    print(f"Found {len(HIER_REL_IDS)} hierarchical relations (name-based): {[id2rel[r_id] for r_id in HIER_REL_IDS]}")
-    print(f"Found {len(HIER_REL_IDS_CAT)} hierarchical relations (category-based): {[id2rel[r_id] for r_id in HIER_REL_IDS_CAT]}")
-    print(f"Found {len(DIRECT_REL_IDS)} direct relations, {len(PATH_REL_IDS)} path relations")
+    # Drive masks from the same map (no string checks)
+    HIER_REL_IDS = {rid for rid, cat in rel_category.items() if cat == 'hier'}
+    DIRECT_REL_IDS = torch.tensor([rid for rid, cat in rel_category.items() if cat == 'direct'], device=device)
+    PATH_REL_IDS   = torch.tensor([], device=device)  # not used for reporting anymore
     
     # Build scoped 2-hop map with gating
-    ignore_names = set(FLAGS.hier_relations)
-    id2rel_dict = {v: k for k, v in r2id.items()}
+    ignore_names = set(FLAGS.hier_relations)                 # existing
+    ignore_names |= {name for name in id2rel_dict.values() if name.startswith('PATH_')}  # add
     
     from storage import build_twohop_map
     twohop_map = build_twohop_map(train_triples,
@@ -458,348 +594,26 @@ def main(_):
     print(f"[2HOP] scoped keys={num_keys}, avg_twohop={avg_twohop:.2f}, scope={FLAGS.twohop_scope}")
     print(f"[2HOP] Config: multi_hop_aware={FLAGS.multi_hop_aware}, weight={FLAGS.twohop_weight}, margin={FLAGS.twohop_margin}")
 
-    if FLAGS.model == "TransE":
-        model = model_definition.TransE(entity_count=len(e2id), relation_count=len(r2id), 
-                                   dim=vector_length, margin=margin, device=device, norm=norm, use_soft_loss=True)
-    elif FLAGS.model == "ComplEx":
-        model = model_definition.ComplEx(entity_count=len(e2id), relation_count=len(r2id), 
-                                     dim=vector_length, margin=margin, device=device, use_soft_loss=True)
-    elif FLAGS.model == "RotatE":
-        model = model_definition.RotatE(entity_count=len(e2id), relation_count=len(r2id), 
-                                    dim=vector_length, margin=margin, device=device, use_soft_loss=True)
-    else:
-        raise ValueError(f"Unknown model: {FLAGS.model}")
-
-    model = model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=FLAGS.lr, weight_decay=1e-4)
-
-    # 3) Seed + AMP scaler
-    import random, numpy as np
-    torch.manual_seed(FLAGS.seed); random.seed(FLAGS.seed); np.random.seed(FLAGS.seed)
-    scaler = torch.cuda.amp.GradScaler(enabled=(FLAGS.amp and FLAGS.use_gpu and torch.cuda.is_available()))
-    device = next(model.parameters()).device
-
-    summary_writer = tensorboard.SummaryWriter(log_dir=FLAGS.tensorboard_log_dir)
-    start_epoch_id = 1
-    step = 0
-    best_score = 0.0
-
-    if FLAGS.checkpoint_path:
-        start_epoch_id, step, best_score = storage.load_checkpoint(FLAGS.checkpoint_path, model, optimizer)
-
-    print(model)
-
-    # Training loop
-    for epoch_id in range(start_epoch_id, epochs + 1):
-        print("Starting epoch: ", epoch_id)
-        loss_impacting_samples_count = 0
-        samples_count = 0
-        model.train()
-        num_negs = FLAGS.num_negs
-        
-        for h, r, t in train_generator:
-            h, r, t = h.to(device), r.to(device), t.to(device)
-            pos = torch.stack([h, r, t], dim=1)                        # [B, 3]
-            B = h.size(0)  # Define B here so it's always available
-
-            # Multi-hop aware negative sampling
-            if FLAGS.relation_aware_negatives:
-                neg = generate_relation_aware_negatives(pos, e2id, r2id, id2rel, device, num_negs, p_tail_id, twohop_map, all_true)
-            else:
-                # Standard Bernoulli corruption
-                rep = pos.repeat_interleave(num_negs, dim=0)               # [B*num_negs, 3]
-                r_flat = rep[:, 1]                                         # relation IDs for each negative
-                p = p_tail_id[r_flat]                                      # corruption probabilities
-                coin = (torch.rand_like(p) > p).long()                     # 0: corrupt tail with prob p, else head
-                rand_e = torch.randint(len(e2id), (B*num_negs,), device=device)
-                rep[:, 0] = torch.where(coin==1, rand_e, rep[:, 0])        # corrupt head
-                rep[:, 2] = torch.where(coin==0, rand_e, rep[:, 2])        # corrupt tail
-                neg = rep
-
-            optimizer.zero_grad(set_to_none=True)
-
-            with torch.cuda.amp.autocast(enabled=(FLAGS.amp and FLAGS.use_gpu and torch.cuda.is_available())):
-                # your existing positive/negative loss (e.g., margin-based ranking)
-                loss, pd, nd = model(pos, neg)                             # per-sample loss
-                
-                # Multi-hop aware loss weighting
-                if FLAGS.multi_hop_aware:
-                    loss = apply_multi_hop_aware_weighting(loss, pos, DIRECT_REL_IDS, PATH_REL_IDS, FLAGS.direct_relation_weight)
-                
-                loss = loss.mean()
-                
-                # OPTIONAL: add inline direct>2hop margin if enabled
-                if FLAGS.multi_hop_aware and FLAGS.twohop_weight > 0.0 and FLAGS.twohop_scope != "none":
-                    # 'batch_pos' is a Python list of (h,r,t) IDs from this mini-batch
-                    batch_pos = [(h[i].item(), r[i].item(), t[i].item()) for i in range(B)]
-                    margin_terms = []
-                    for (h_id, r_id, t_id) in batch_pos:
-                        # only apply to 'direct' relations
-                        if rel_category.get(r_id) != "direct":
-                            continue
-                        t2_list = list(twohop_map.get((h_id, r_id), []))[:2]  # small sample per pos
-                        if not t2_list: 
-                            continue
-                        H = torch.tensor([h_id]*len(t2_list), device=device)
-                        R = torch.tensor([r_id]*len(t2_list), device=device)
-                        T_pos = torch.tensor([t_id]*len(t2_list), device=device)
-                        T2 = torch.tensor(t2_list, device=device)
-                        s_pos = model.score_triple(H, R, T_pos)   # you expose this in model.py (see Patch 4)
-                        s_neg = model.score_triple(H, R, T2)
-                        margin_terms.append(torch.relu(s_neg - s_pos + FLAGS.twohop_margin))
-                    if margin_terms:
-                        twohop_loss = FLAGS.twohop_weight * torch.cat(margin_terms).mean()
-                        loss = loss + twohop_loss
-                        # Debug: log 2-hop loss occasionally
-                        if step % 100 == 0:
-                            print(f"[2HOP] Step {step}: margin_terms={len(margin_terms)}, twohop_loss={twohop_loss.item():.4f}")
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            step += 1
-            
-            # Update tracking variables
-            loss_impacting_samples_count += 1 if loss.item() > 0 else 0
-            samples_count += B
-            
-            # Log training metrics
-            summary_writer.add_scalar('Loss/train', loss.data.cpu().numpy(), global_step=step)
-            summary_writer.add_scalar('Distance/positive', pd.mean().data.cpu().numpy(), global_step=step)
-            summary_writer.add_scalar('Distance/negative', nd.mean().data.cpu().numpy(), global_step=step)
-
-        # Log epoch-level metrics
-        if samples_count > 0:
-            summary_writer.add_scalar('Metrics/loss_impacting_samples', loss_impacting_samples_count / samples_count * 100,
-                                      global_step=epoch_id)
-
-        # Initialize score to avoid UnboundLocalError
-        score = 0.0
-        
-        if epoch_id % FLAGS.validation_freq == 0:
-            model.eval()
-            
-            # Score separation diagnostic: check if model is learning to distinguish positives from negatives
-            # Sample 200 positives and 200 uniform negatives to inspect score gap
-            import numpy as np, random
-            device = next(model.parameters()).device
-            sample_pos = random.sample(valid_triples, min(200, len(valid_triples)))
-            pos_scores = []
-            neg_scores = []
-            E = len(e2id)
-            true_set = set(train_triples) | set(valid_triples) | set(test_triples)
-
-            for (h,r,t) in sample_pos:
-                pos_scores.append(model.score_triple(torch.tensor([h],device=device),
-                                                     torch.tensor([r],device=device),
-                                                     torch.tensor([t],device=device)).item())
-                # uniform tail neg not in true_set
-                while True:
-                    tneg = random.randrange(E)
-                    if (h,r,tneg) not in true_set: break
-                neg_scores.append(model.score_triple(torch.tensor([h],device=device),
-                                                     torch.tensor([r],device=device),
-                                                     torch.tensor([tneg],device=device)).item())
-            print(f"[VAL] pos_mean={np.mean(pos_scores):.3f} neg_mean={np.mean(neg_scores):.3f} "
-                  f"sep={np.mean(pos_scores)-np.mean(neg_scores):.3f}")
-            
-            # Use efficient filtered evaluation (both regular and type-constrained)
-            print("\n--- Regular Filtered Evaluation ---")
-            tail_results = eval_tail_filtered(model, validation_set, len(e2id), device, tails_by_hr, HIER_REL_IDS, etype_tensor, type_constrained=False, allowed_tails=allowed_tails)
-            head_results = eval_head_filtered(model, validation_set, len(e2id), device, heads_by_rt, HIER_REL_IDS, etype_tensor, type_constrained=False, allowed_heads=allowed_heads)
-            
-            print("\n--- Type-Constrained Filtered Evaluation ---")
-            tail_results_tc = eval_tail_filtered(model, validation_set, len(e2id), device, tails_by_hr, HIER_REL_IDS, etype_tensor, type_constrained=FLAGS.eval_type_constrained, allowed_tails=allowed_tails)
-            head_results_tc = eval_head_filtered(model, validation_set, len(e2id), device, heads_by_rt, HIER_REL_IDS, etype_tensor, type_constrained=FLAGS.eval_type_constrained, allowed_heads=allowed_heads)
-            
-            # Average the results (use type-constrained for main metrics)
-            avg_hits_10 = (tail_results_tc["H@10"] + head_results_tc["H@10"]) / 2
-            avg_mrr = (tail_results_tc["MRR"] + head_results_tc["MRR"]) / 2
-            
-            print(f"Epoch {epoch_id} - Regular - Tail: H@1={tail_results['H@1']:.3f}, H@10={tail_results['H@10']:.3f}, MRR={tail_results['MRR']:.3f}")
-            print(f"Epoch {epoch_id} - Regular - Head: H@1={head_results['H@1']:.3f}, H@10={head_results['H@10']:.3f}, MRR={head_results['MRR']:.3f}")
-            print(f"Epoch {epoch_id} - Type-Constrained - Tail: H@1={tail_results_tc['H@1']:.3f}, H@10={tail_results_tc['H@10']:.3f}, MRR={tail_results_tc['MRR']:.3f}")
-            print(f"Epoch {epoch_id} - Type-Constrained - Head: H@1={head_results_tc['H@1']:.3f}, H@10={head_results_tc['H@10']:.3f}, MRR={head_results_tc['MRR']:.3f}")
-            print(f"Epoch {epoch_id} - Type-Constrained Avg: H@1={(tail_results_tc['H@1'] + head_results_tc['H@1'])/2:.3f}, H@10={avg_hits_10:.3f}, MRR={avg_mrr:.3f}")
-            
-            score = avg_hits_10
-        
-        if score > best_score:
-            best_score = score
-            checkpoint_path = f"checkpoint_{FLAGS.model}.tar"
-            storage.save_checkpoint(model, optimizer, epoch_id, step, best_score, checkpoint_path)
-
-    # Testing the best checkpoint on test dataset
-    checkpoint_path = f"checkpoint_{FLAGS.model}.tar"
-    storage.load_checkpoint(checkpoint_path, model, optimizer)
-    best_model = model.to(device)
-    best_model.eval()
+    # Import and call the training function
+    from train import train_and_eval
     
-    # Use efficient filtered evaluation on test set (both regular and type-constrained)
-    print("=== FINAL TEST RESULTS ===")
-    print("\n--- Regular Filtered Test Results ---")
-    tail_results = eval_tail_filtered(best_model, test_set, len(e2id), device, tails_by_hr, HIER_REL_IDS, etype_tensor, type_constrained=False, allowed_tails=allowed_tails)
-    head_results = eval_head_filtered(best_model, test_set, len(e2id), device, heads_by_rt, HIER_REL_IDS, etype_tensor, type_constrained=False, allowed_heads=allowed_heads)
-    
-    print(f"Regular - Tail: H@1={tail_results['H@1']:.3f}, H@3={tail_results['H@3']:.3f}, H@10={tail_results['H@10']:.3f}, MRR={tail_results['MRR']:.3f}")
-    print(f"Regular - Head: H@1={head_results['H@1']:.3f}, H@3={head_results['H@3']:.3f}, H@10={head_results['H@10']:.3f}, MRR={head_results['MRR']:.3f}")
-    
-    avg_hits_1 = (tail_results["H@1"] + head_results["H@1"]) / 2
-    avg_hits_3 = (tail_results["H@3"] + head_results["H@3"]) / 2
-    avg_hits_10 = (tail_results["H@10"] + head_results["H@10"]) / 2
-    avg_mrr = (tail_results["MRR"] + head_results["MRR"]) / 2
-    print(f"Regular Average: H@1={avg_hits_1:.3f}, H@3={avg_hits_3:.3f}, H@10={avg_hits_10:.3f}, MRR={avg_mrr:.3f}")
-    
-    print("\n--- Type-Constrained Filtered Test Results ---")
-    tail_results_tc = eval_tail_filtered(best_model, test_set, len(e2id), device, tails_by_hr, HIER_REL_IDS, etype_tensor, type_constrained=FLAGS.eval_type_constrained, allowed_tails=allowed_tails)
-    head_results_tc = eval_head_filtered(best_model, test_set, len(e2id), device, heads_by_rt, HIER_REL_IDS, etype_tensor, type_constrained=FLAGS.eval_type_constrained, allowed_heads=allowed_heads)
-    
-    print(f"Type-Constrained - Tail: H@1={tail_results_tc['H@1']:.3f}, H@3={tail_results_tc['H@3']:.3f}, H@10={tail_results_tc['H@10']:.3f}, MRR={tail_results_tc['MRR']:.3f}")
-    print(f"Type-Constrained - Head: H@1={head_results_tc['H@1']:.3f}, H@3={head_results_tc['H@3']:.3f}, H@10={head_results_tc['H@10']:.3f}, MRR={head_results_tc['MRR']:.3f}")
-    
-    avg_hits_1_tc = (tail_results_tc["H@1"] + head_results_tc["H@1"]) / 2
-    avg_hits_3_tc = (tail_results_tc["H@3"] + head_results_tc["H@3"]) / 2
-    avg_hits_10_tc = (tail_results_tc["H@10"] + head_results_tc["H@10"]) / 2
-    avg_mrr_tc = (tail_results_tc["MRR"] + head_results_tc["MRR"]) / 2
-    print(f"Type-Constrained Average: H@1={avg_hits_1_tc:.3f}, H@3={avg_hits_3_tc:.3f}, H@10={avg_hits_10_tc:.3f}, MRR={avg_mrr_tc:.3f}")
-    
-    # === NEW RANKING EVALUATION WITH CALIBRATION ===
-    print("\n=== COMPREHENSIVE RANKING EVALUATION ===")
-    from metric import evaluate_ranking, fit_calibrator
-    from inference import rank_topk, predict_binary
-    
-    metrics = evaluate_ranking(model, test_triples, all_true=all_true,
-                               e2id=e2id, r2id=r2id,
-                               filtered=FLAGS.eval_filtered,
-                               per_relation=FLAGS.eval_per_relation,
-                               train_triples=train_triples,
-                               type_constrained=FLAGS.eval_type_constrained)
-    
-    # Print per-category results if available
-    if "per_category" in metrics:
-        print("\n--- Per-Category Results ---")
-        for category, results in metrics["per_category"].items():
-            print(f"{category}: MRR={results['MRR']:.3f}, H@1={results['Hits@1']:.3f}, "
-                  f"H@3={results['Hits@3']:.3f}, H@10={results['Hits@10']:.3f}, count={results['count']}")
-    
-    if FLAGS.calibration != "none":
-        print(f"Fitting {FLAGS.calibration} calibrator on validation set...")
-        calibrator = fit_calibrator(model, valid_triples, method=FLAGS.calibration)
-        print("Calibrator fitted successfully.")
-    else:
-        calibrator = None
-        print("No calibration requested.")
-    
-    # Example quick checks (remove in prod):
-    # print(rank_topk(model, "cwe:79", "RelatedWeakness", e2id, r2id, k=5,
-    #                 filtered=FLAGS.eval_filtered, all_true=all_true))
-    # print(predict_binary(model, ("cwe:79","RelatedWeakness","capec:63"), e2id, r2id, calibrator))
-    
-    # Store results in a text file
-    store_results_to_file(
-        regular_tail=tail_results,
-        regular_head=head_results,
-        tc_tail=tail_results_tc,
-        tc_head=head_results_tc,
-        dataset_path=FLAGS.dataset_path,
-        model_params={
-            'vector_length': FLAGS.vector_length,
-            'margin': FLAGS.margin,
-            'norm': FLAGS.norm,
-            'lr': FLAGS.lr,
-            'epochs': FLAGS.epochs,
-            'batch_size': FLAGS.batch_size,
-            'num_negs': FLAGS.num_negs,
-            'self_adversarial': FLAGS.self_adversarial
-        },
-        model_name=FLAGS.model  # Add model name
+    train_and_eval(
+        model, FLAGS,
+        e2id, r2id,
+        train_triples, valid_triples, test_triples,
+        train_set, validation_set, test_set,
+        tails_by_hr, heads_by_rt,
+        rel_category, HIER_REL_IDS,
+        allowed_heads, allowed_tails,
+        etype_tensor,
+        twohop_map,
+        p_tail_id,
+        save_ckpt=save_ckpt,
+        load_ckpt=load_ckpt,
+        evaluate_all=evaluate_all,
     )
 
 
-def store_results_to_file(regular_tail, regular_head, tc_tail, tc_head, dataset_path, model_params, model_name):
-    """Store evaluation results to a text file with timestamp and model parameters."""
-    import datetime
-    
-    # Create results filename with timestamp and model name
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_file = f"results_{model_name}_{timestamp}.txt"
-    
-    with open(results_file, 'w') as f:
-        f.write("=" * 80 + "\n")
-        f.write(f"{model_name} Model Evaluation Results\n")
-        f.write("=" * 80 + "\n")
-        f.write(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Dataset: {dataset_path}\n")
-        f.write(f"Model: {model_name}\n")
-        f.write("\n")
-        
-        # Model parameters
-        f.write("Model Parameters:\n")
-        f.write("-" * 40 + "\n")
-        f.write(f"model: {model_name}\n")
-        for param, value in model_params.items():
-            f.write(f"{param}: {value}\n")
-        f.write("\n")
-        
-        # Regular filtered evaluation results
-        f.write("Regular Filtered Evaluation Results:\n")
-        f.write("-" * 40 + "\n")
-        f.write(f"Tail Prediction:\n")
-        f.write(f"  H@1:  {regular_tail['H@1']:.4f}\n")
-        f.write(f"  H@3:  {regular_tail['H@3']:.4f}\n")
-        f.write(f"  H@10: {regular_tail['H@10']:.4f}\n")
-        f.write(f"  MRR:  {regular_tail['MRR']:.4f}\n")
-        f.write(f"  Queries: {regular_tail['num_queries']}\n")
-        f.write(f"\nHead Prediction:\n")
-        f.write(f"  H@1:  {regular_head['H@1']:.4f}\n")
-        f.write(f"  H@3:  {regular_head['H@3']:.4f}\n")
-        f.write(f"  H@10: {regular_head['H@10']:.4f}\n")
-        f.write(f"  MRR:  {regular_head['MRR']:.4f}\n")
-        f.write(f"  Queries: {regular_head['num_queries']}\n")
-        
-        # Regular averages
-        avg_hits_1 = (regular_tail["H@1"] + regular_head["H@1"]) / 2
-        avg_hits_3 = (regular_tail["H@3"] + regular_head["H@3"]) / 2
-        avg_hits_10 = (regular_tail["H@10"] + regular_head["H@10"]) / 2
-        avg_mrr = (regular_tail["MRR"] + regular_head["MRR"]) / 2
-        f.write(f"\nRegular Average:\n")
-        f.write(f"  H@1:  {avg_hits_1:.4f}\n")
-        f.write(f"  H@3:  {avg_hits_3:.4f}\n")
-        f.write(f"  H@10: {avg_hits_10:.4f}\n")
-        f.write(f"  MRR:  {avg_mrr:.4f}\n")
-        f.write("\n")
-        
-        # Type-constrained evaluation results
-        f.write("Type-Constrained Filtered Evaluation Results:\n")
-        f.write("-" * 40 + "\n")
-        f.write(f"Tail Prediction:\n")
-        f.write(f"  H@1:  {tc_tail['H@1']:.4f}\n")
-        f.write(f"  H@3:  {tc_tail['H@3']:.4f}\n")
-        f.write(f"  H@10: {tc_tail['H@10']:.4f}\n")
-        f.write(f"  MRR:  {tc_tail['MRR']:.4f}\n")
-        f.write(f"  Queries: {tc_tail['num_queries']}\n")
-        f.write(f"\nHead Prediction:\n")
-        f.write(f"  H@1:  {tc_head['H@1']:.4f}\n")
-        f.write(f"  H@3:  {tc_head['H@3']:.4f}\n")
-        f.write(f"  H@10: {tc_head['H@10']:.4f}\n")
-        f.write(f"  MRR:  {tc_head['MRR']:.4f}\n")
-        f.write(f"  Queries: {tc_head['num_queries']}\n")
-        
-        # Type-constrained averages
-        avg_hits_1_tc = (tc_tail["H@1"] + tc_head["H@1"]) / 2
-        avg_hits_3_tc = (tc_tail["H@3"] + tc_head["H@3"]) / 2
-        avg_hits_10_tc = (tc_tail["H@10"] + tc_head["H@10"]) / 2
-        avg_mrr_tc = (tc_tail["MRR"] + tc_head["MRR"]) / 2
-        f.write(f"\nType-Constrained Average:\n")
-        f.write(f"  H@1:  {avg_hits_1_tc:.4f}\n")
-        f.write(f"  H@3:  {avg_hits_3_tc:.4f}\n")
-        f.write(f"  H@10: {avg_hits_10_tc:.4f}\n")
-        f.write(f"  MRR:  {avg_mrr_tc:.4f}\n")
-        f.write("\n")
-        
-        f.write("=" * 80 + "\n")
-    
-    print(f"Results saved to: {results_file}")
 
 
 if __name__ == '__main__':

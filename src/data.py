@@ -115,10 +115,20 @@ def categorize_relations(train_triples, e2type, r2id, type_CWE="CWE", type_CAPEC
     direct = only crosses CWE<->CAPEC (no intra-type)
     hier   = only intra-type and appears as parent/child (name heuristics optional)
     path   = everything else
+    
+    Filters out PATH_* pseudo-relations which are artifacts from two-hop composition.
     """
     from collections import defaultdict
+    
+    # Create reverse mapping from relation ID to relation name
+    id2rel = {v: k for k, v in r2id.items()}
+    
     pairs = defaultdict(set)   # r -> set of (type(h), type(t))
     for (h,r,t) in train_triples:
+        # Filter out PATH_* pseudo-relations
+        rel_name = id2rel.get(r, "")
+        if rel_name.startswith("PATH_"):
+            continue
         pairs[r].add((e2type[h], e2type[t]))
 
     rel_category = {}
@@ -130,4 +140,31 @@ def categorize_relations(train_triples, e2type, r2id, type_CWE="CWE", type_CAPEC
             rel_category[r] = "direct"
         else:
             rel_category[r] = "path"
+    return rel_category
+
+
+def categorize_relations_by_name(id2rel, direct_names=None, hier_names=None):
+    """
+    Return: rel_category[rid] in {"direct","hier","other"} using relation NAMES only.
+    - Stable and matches your domain schema.
+    - PATH_* or any unknown names -> "other".
+    """
+    if direct_names is None:
+        direct_names = {
+            "has_attack_pattern", "exploits_weakness", "related_to",
+            "DIRECT_has_attack_pattern", "DIRECT_exploits_weakness", "DIRECT_related_to",
+        }
+    if hier_names is None:
+        hier_names = {
+            "is_child_of", "has_child", "is_parent_of", "has_parent",
+            "parent_of", "child_of", "subclass_of", "superclass_of",
+        }
+    rel_category = {}
+    for rid, name in id2rel.items():
+        if name in hier_names:
+            rel_category[rid] = "hier"
+        elif name in direct_names:
+            rel_category[rid] = "direct"
+        else:
+            rel_category[rid] = "other"
     return rel_category
